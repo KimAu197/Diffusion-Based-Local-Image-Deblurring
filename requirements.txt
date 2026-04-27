@@ -1,0 +1,14 @@
+numpy
+Pillow
+PyYAML
+tqdm
+
+# Optional for checkpoint-backed training/inference. Code paths are guarded.
+torch
+diffusers
+transformers
+accelerate
+safetensors
+huggingface_hub
+gdown
+scikit-image

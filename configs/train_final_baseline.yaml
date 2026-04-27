@@ -1,0 +1,37 @@
+training:
+  phase: pretrain
+  seed: 42
+  split_seed: 2026
+  val_fraction: 0.1
+  image_size: 256
+  max_steps: 30
+  validation_batches: 4
+  num_workers: 0
+  output_dir: output/training/final_baseline_task010
+  note: "Images are resized to 256 for a bounded local final run."
+
+data:
+  synthetic_manifest: output/datasets/coco2017_train_grouped_localblur_5k/manifest.json
+
+model:
+  checkpoint: null
+  allow_downloads: false
+  fallback: false
+
+trainable_baseline:
+  model: ConditionalLocalDeblurNet
+  base_channels: 16
+  batch_size: 4
+  learning_rate: 0.0005
+
+losses:
+  image_weight: 1.0
+  mask_weight: 0.1
+  restoration:
+    masked_l1_weight: 0.8
+    charbonnier_weight: 0.2
+  mask_head:
+    enabled: true
+    weight: 0.1
+    bce_weight: 1.0
+    dice_weight: 0.5

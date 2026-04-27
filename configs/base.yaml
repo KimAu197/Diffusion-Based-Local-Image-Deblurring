@@ -1,0 +1,26 @@
+project:
+  name: local-deblur
+  image_size: 512
+  target_compute: A100 40GB
+  smoke_first: true
+  require_confirmation_for_full_runs: true
+
+paths:
+  cache_dir: cache
+  output_dir: output
+  results_dir: results
+  data_dir: data
+
+modes:
+  dry_run: true
+  train_phases:
+    - pretrain
+    - finetune
+  eval_modes:
+    - standard
+    - thinking
+
+runtime:
+  seed: 42
+  device: auto
+  allow_downloads: false

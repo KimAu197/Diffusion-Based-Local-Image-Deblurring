@@ -1,0 +1,11 @@
+{
+  "samples": [
+    {
+      "sample_id": "example_local_blur",
+      "Ib": "path/to/blurred_image.png",
+      "M": "path/to/blur_mask.png",
+      "S": "path/to/optional_segmentation.png",
+      "target": "path/to/sharp_target.png"
+    }
+  ]
+}

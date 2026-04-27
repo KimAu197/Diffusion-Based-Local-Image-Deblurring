@@ -1,0 +1,14 @@
+{
+  "active": false,
+  "last_modified_files": [],
+  "last_stop_generation_id": null,
+  "last_subagent_generation_id": null,
+  "last_task_id": "task-019",
+  "last_worker_role": "MemorySaver",
+  "last_worker_status": null,
+  "last_worker_summary": null,
+  "started_at_ms": 1777255661234,
+  "updated_at_ms": 1777260210912,
+  "version": 1,
+  "workflow_status": "completed"
+}

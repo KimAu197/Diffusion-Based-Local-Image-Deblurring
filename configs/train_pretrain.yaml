@@ -1,0 +1,31 @@
+training:
+  phase: pretrain
+  image_size: 512
+  dry_run: false
+  max_steps: 1
+  output_dir: output/training/pretrain
+  target_compute: A100 40GB
+
+data:
+  synthetic_manifest: output/datasets/coco2017_train_grouped_localblur_5k/manifest.json
+  coco_images: /autodl-pub/data/COCO2017/train2017.zip
+  global_blur_dir: null
+
+model:
+  checkpoint: null
+  allow_downloads: false
+  fallback: true
+
+trainable_baseline:
+  model: ConditionalLocalDeblurNet
+  base_channels: 32
+  batch_size: 4
+  learning_rate: 0.001
+
+losses:
+  restoration:
+    masked_l1_weight: 0.8
+    charbonnier_weight: 0.2
+  mask_head:
+    enabled: true
+    bce_weight: 0.1

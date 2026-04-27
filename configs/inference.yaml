@@ -1,0 +1,16 @@
+inference:
+  dry_run: true
+  output: output/inference/dry_run_output.png
+  mask_output: output/inference/dry_run_predicted_mask.png
+  image_size: 512
+
+inputs:
+  image: null
+  mask: null
+  segmentation: null
+  checkpoint: null
+
+runtime:
+  allow_downloads: false
+  preserve_background: true
+  output_predicted_mask: true

@@ -1,0 +1,46 @@
+model:
+  checkpoint: null
+  use_diffusers: false
+  dry_run_fallback: true
+  allow_downloads: false
+
+sd_controlnet:
+  base_sd_checkpoint: null
+  controlnet_checkpoint: null
+  local_files_only: true
+  allow_downloads: false
+  dtype: float16
+  precision: fp16
+  image_size: 512
+  conditioning_channels: 3
+  mask_head_enabled: true
+
+conditioning:
+  use_mask: true
+  use_segmentation: true
+  use_clip_image_guidance: true
+  concatenate_blurred_latent: true
+  blurred_latent_initialization: true
+  repaint_postprocess: true
+  controlnet_rgb_mapping: R=blurred_gray_context,G=blur_mask,B=segmentation_or_background_context
+
+mask_head:
+  enabled: true
+  attach_to: controlnet_encoder_mid_features
+  loss: binary_cross_entropy
+  loss_weight: 0.1
+  output_debug_mask: true
+
+trainable_baseline:
+  class_name: ConditionalLocalDeblurNet
+  base_channels: 32
+  use_segmentation: true
+  outputs:
+    - restored_rgb
+    - mask_logits
+    - mask_probability
+
+fallback:
+  deterministic: true
+  preserve_background: true
+  boundary_smoothing_radius: 2.0

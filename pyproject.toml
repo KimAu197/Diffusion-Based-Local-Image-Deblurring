@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-deblur"
+version = "0.1.0"
+description = "Smoke-runnable scaffold for diffusion-style local image deblurring research."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Local Deblur Contributors" }]
+dependencies = [
+  "numpy",
+  "Pillow",
+  "PyYAML",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+torch = ["torch"]
+diffusion = ["diffusers", "transformers", "accelerate"]
+metrics = ["scikit-image"]
+
+[tool.setuptools.packages.find]
+include = ["local_deblur*", "evaluation*"]

@@ -1,0 +1,50 @@
+# Bounded COCO synthetic SD 1.5 + Tile ControlNet pretraining smoke config.
+# This validates the diffusers-backed ControlNet latent objective and auxiliary
+# mask-head path with the requested SD 1.5 + tile ControlNet model pair.
+
+experiment:
+  name: sd_controlnet_coco_pretrain
+  label: sd15_tile_controlnet_coco_smoke
+  limitation: Bounded SD 1.5 + Tile ControlNet smoke/pretraining run; not a converged full training checkpoint.
+  output_dir: output/training/sd15_tile_controlnet_coco_pretrain
+  seed: 42
+
+data:
+  manifest: output/datasets/coco2017_train_grouped_localblur_5k/manifest.json
+  dataset_name: coco2017_train_grouped_localblur_5k
+  image_size: 256
+  subset_train_count: 8
+  subset_val_count: 2
+  val_fraction: 0.1
+  split_seed: 42
+  num_workers: 0
+
+sd_controlnet:
+  base_sd_checkpoint: /root/autodl-tmp/models/sd15-fp16
+  controlnet_init: from_pretrained
+  controlnet_checkpoint: /root/autodl-tmp/models/control-v11f1e-sd15-tile
+  cache_dir: /root/autodl-tmp/cache/huggingface
+  allow_downloads: false
+  local_files_only: true
+  dtype: float32
+  precision: fp32
+  variant: fp16
+  train_controlnet: true
+  train_unet: false
+  train_text_encoder: false
+  train_vae: false
+  mask_head_enabled: true
+  mask_head_channels: 16
+
+training:
+  max_steps: 2
+  batch_size: 1
+  learning_rate: 0.000001
+  gradient_accumulation_steps: 1
+  validation_batches: 1
+  prompt: local deblur restoration
+  diffusion_loss_weight: 1.0
+  mask_loss_weight: 0.1
+  mask_bce_weight: 1.0
+  mask_dice_weight: 0.5
+  save_controlnet: true

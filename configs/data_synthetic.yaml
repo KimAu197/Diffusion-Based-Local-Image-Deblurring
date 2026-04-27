@@ -1,0 +1,19 @@
+data:
+  image_size: 512
+  dry_run: false
+  output_dir: output/datasets/coco2017_train_grouped_localblur_5k
+  manifest: output/datasets/coco2017_train_grouped_localblur_5k/manifest.json
+
+sources:
+  coco_images: /autodl-pub/data/COCO2017/train2017.zip
+  coco_instances: /autodl-pub/data/COCO2017/annotations_trainval2017.zip
+  global_blur_dir: null
+  reloblur_dir: null
+
+synthetic:
+  blur_types:
+    - gaussian
+    - motion
+    - defocus
+  preserve_background: true
+  mask_centered_crop: true

@@ -1,0 +1,40 @@
+# Stable Diffusion + ControlNet local deblurring configuration.
+# No checkpoints are downloaded unless allow_downloads is set true.
+
+sd_controlnet:
+  # Base Stable Diffusion checkpoint path or repo id.
+  # Keep null for smoke tests; set to a local path for training/inference.
+  base_sd_checkpoint: null
+
+  # Optional ControlNet checkpoint path or repo id.
+  # Keep null until local ControlNet weights are available.
+  controlnet_checkpoint: null
+
+  # Download policy. task-015 smoke tests require local-only behavior.
+  allow_downloads: false
+  local_files_only: true
+
+  # Precision/dtype forwarded to diffusers when checkpoints are loaded.
+  dtype: float16
+  precision: fp16
+
+  # Spatial training/inference size and ControlNet condition shape.
+  image_size: 512
+  conditioning_channels: 3
+
+  # Auxiliary blur-mask head trained beside diffusion latent/noise objective.
+  mask_head_enabled: true
+  mask_head_channels: 32
+
+conditioning:
+  # ControlNet condition image is RGB:
+  # R = blurred grayscale/context
+  # G = blur mask
+  # B = segmentation if available, otherwise inverse-mask background context
+  controlnet_rgb_mapping: blurred_gray_mask_segmentation_or_background
+
+training:
+  # Placeholder integration settings only; task-015 does not run training.
+  gradient_accumulation_steps: 1
+  train_diffusion: false
+  train_auxiliary_mask_head: true

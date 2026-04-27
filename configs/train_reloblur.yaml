@@ -1,0 +1,24 @@
+training:
+  phase: finetune
+  image_size: 512
+  dry_run: true
+  max_steps: 1
+  output_dir: output/training/reloblur
+  target_compute: A100 40GB
+
+data:
+  reloblur_manifest: null
+  reloblur_root: null
+
+model:
+  pretrained_checkpoint: null
+  allow_downloads: false
+  fallback: true
+
+losses:
+  restoration:
+    masked_l1_weight: 0.8
+    charbonnier_weight: 0.2
+  mask_head:
+    enabled: true
+    bce_weight: 0.1

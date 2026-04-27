@@ -1,0 +1,38 @@
+evaluation:
+  dry_run: false
+  split: val
+  image_size: 256
+  visual_limit: 12
+  metrics:
+    - psnr
+    - ssim
+    - weighted_psnr
+    - weighted_ssim
+    - aligned_psnr
+    - aligned_ssim
+    - mask_iou
+    - mask_dice
+    - mask_bce
+  output_structure:
+    root: results/<ROUND>_<MODEL>_<DATASET>_<COUNT>_<MMDD>[_HHMM]
+    files:
+      - logging.log
+      - metrics.csv
+      - summary.txt
+      - answer.json
+      - log/
+
+data:
+  manifest: output/datasets/coco2017_train_grouped_localblur_5k/manifest.json
+
+split:
+  name: val
+  split_seed: 2026
+  val_fraction: 0.1
+
+model:
+  checkpoint: output/training/final_baseline_task010/best.pt
+
+baseline_context:
+  lbag_psnr: 34.71
+  lbag_ssim: 0.967
