@@ -8,6 +8,7 @@ Diffusers checkpoint loading only happens when explicitly requested.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -32,6 +33,10 @@ class SDControlNetConfig:
 
     base_sd_checkpoint: str | None = None
     controlnet_checkpoint: str | None = None
+    mask_head_checkpoint: str | None = None
+    cache_dir: str | None = None
+    variant: str | None = None
+    device: str | None = None
     local_files_only: bool = True
     allow_downloads: bool = False
     dtype: str = "float16"
@@ -70,10 +75,15 @@ class SDControlNetConfig:
         raise ValueError(f"Unsupported dtype/precision: {self.dtype!r}")
 
     def diffusers_load_kwargs(self) -> dict[str, Any]:
-        return {
+        kwargs: dict[str, Any] = {
             "local_files_only": self.local_files_only,
             "torch_dtype": self.torch_dtype,
         }
+        if self.cache_dir:
+            kwargs["cache_dir"] = self.cache_dir
+        if self.variant:
+            kwargs["variant"] = self.variant
+        return kwargs
 
 
 @dataclass
@@ -208,12 +218,37 @@ class StableDiffusionControlNetLocalDeblurPipeline:
             raise RuntimeError("diffusers is required for SD + ControlNet checkpoint loading") from exc
 
         kwargs = self.config.diffusers_load_kwargs()
-        self.controlnet = ControlNetModel.from_pretrained(self.config.controlnet_checkpoint, **kwargs)
+        controlnet_kwargs = dict(kwargs)
+        try:
+            self.controlnet = ControlNetModel.from_pretrained(self.config.controlnet_checkpoint, **controlnet_kwargs)
+        except OSError:
+            if "variant" not in controlnet_kwargs:
+                raise
+            controlnet_kwargs.pop("variant", None)
+            self.controlnet = ControlNetModel.from_pretrained(self.config.controlnet_checkpoint, **controlnet_kwargs)
+
+        pipeline_kwargs = dict(kwargs)
+        pipeline_kwargs.update(
+            {
+                "controlnet": self.controlnet,
+                "safety_checker": None,
+                "requires_safety_checker": False,
+            }
+        )
         self.pipeline = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
             self.config.base_sd_checkpoint,
-            controlnet=self.controlnet,
-            **kwargs,
+            **pipeline_kwargs,
         )
+        device = self.config.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.pipeline.to(device)
+        self.controlnet.to(device=device, dtype=self.config.torch_dtype)
+        if self.mask_head is not None:
+            self.mask_head.to(device=device, dtype=torch.float32)
+            self.mask_head.eval()
+            if self.config.mask_head_checkpoint:
+                checkpoint = torch.load(Path(self.config.mask_head_checkpoint), map_location="cpu")
+                state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+                self.mask_head.load_state_dict(state_dict, strict=True)
 
     def prepare_condition(self, sample: LocalDeblurSample) -> Image.Image:
         return build_controlnet_condition_from_sample(sample, image_size=self.config.image_size)
@@ -222,8 +257,10 @@ class StableDiffusionControlNetLocalDeblurPipeline:
         if self.mask_head is None:
             return None
 
-        condition = controlnet_condition_to_tensor(condition_image, dtype=torch.float32)
-        return self.mask_head(condition)
+        device = next(self.mask_head.parameters()).device
+        condition = controlnet_condition_to_tensor(condition_image, device=str(device), dtype=torch.float32)
+        with torch.no_grad():
+            return self.mask_head(condition)
 
     def prepare_training_inputs(self, sample: LocalDeblurSample) -> dict[str, Any]:
         item = sample_to_tensors(sample, image_size=self.config.image_size, include_segmentation=True)
@@ -241,4 +278,5 @@ class StableDiffusionControlNetLocalDeblurPipeline:
         if self.pipeline is None:
             raise RuntimeError("Diffusers pipeline is not loaded; call load_diffusers() with local checkpoints first")
         condition_image = self.prepare_condition(sample)
-        return self.pipeline(image=sample.blurred, control_image=condition_image, **kwargs)
+        image = resize_to(sample.blurred, self.config.image_size, is_mask=False)
+        return self.pipeline(image=image, control_image=condition_image, **kwargs)

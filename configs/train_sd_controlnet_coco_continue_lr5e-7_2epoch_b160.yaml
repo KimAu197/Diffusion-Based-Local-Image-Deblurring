@@ -1,12 +1,10 @@
-# Bounded COCO synthetic SD 1.5 + Tile ControlNet pretraining smoke config.
-# This validates the diffusers-backed ControlNet latent objective and auxiliary
-# mask-head path with the requested SD 1.5 + tile ControlNet model pair.
+# Continue COCO synthetic SD 1.5 + Tile ControlNet pretraining from the 3-epoch b160 run.
 
 experiment:
-  name: sd_controlnet_coco_pretrain
-  label: phase1_sd15_tile_controlnet_coco_pretrain
-  limitation: Phase 1 SD 1.5 + Tile ControlNet COCO synthetic pretraining run; not ReLoBlur posttraining or final benchmark performance.
-  output_dir: output/training/phase1_sd15_tile_controlnet_coco_pretrain_3epoch_b160
+  name: sd_controlnet_coco_continue_lr5e-7_2epoch_b160
+  label: phase1_sd15_tile_controlnet_coco_continue_lr5e-7_2epoch_b160
+  limitation: Continuation run from the completed 3-epoch b160 Phase 1 checkpoint with lower learning rate.
+  output_dir: output/training/phase1_sd15_tile_controlnet_coco_continue_lr5e-7_2epoch_b160
   seed: 42
 
 data:
@@ -23,7 +21,8 @@ data:
 sd_controlnet:
   base_sd_checkpoint: /root/autodl-tmp/models/sd15-fp16
   controlnet_init: from_pretrained
-  controlnet_checkpoint: /root/autodl-tmp/models/control-v11f1e-sd15-tile
+  controlnet_checkpoint: /root/autodl-tmp/project/output/training/phase1_sd15_tile_controlnet_coco_pretrain_3epoch_b160/checkpoint/controlnet
+  mask_head_checkpoint: /root/autodl-tmp/project/output/training/phase1_sd15_tile_controlnet_coco_pretrain_3epoch_b160/checkpoint/aux_mask_head.pt
   cache_dir: /root/autodl-tmp/cache/huggingface
   allow_downloads: false
   local_files_only: true
@@ -39,9 +38,9 @@ sd_controlnet:
 
 training:
   max_steps: null
-  epochs: 5
+  epochs: 2
   batch_size: 160
-  learning_rate: 0.000001
+  learning_rate: 0.0000005
   gradient_accumulation_steps: 1
   validation_batches: 16
   validation_interval_steps: 50

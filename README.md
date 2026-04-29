@@ -49,4 +49,4 @@ Evaluation results use `results/<ROUND>_<MODEL>_<DATASET>_<COUNT>_<MMDD>[_HHMM]/
 
 ## Current Data Status
 
-The current processed dataset is `output/datasets/coco2017_train_grouped_localblur_5k/manifest.json`. It uses COCO instance masks, groups people with nearby carried objects, filters edge/black-border crops, keeps final blur masks under 35% of the image, and mixes motion/Gaussian/defocus blur. See `docs/data_status.md` for details.
+The current processed dataset is `output/datasets/coco2017_train_grouped_localblur_5k/manifest.json`. It uses COCO instance masks, groups people with nearby carried objects, filters edge/black-border crops, and mixes motion/Gaussian/defocus blur. This existing dataset was generated with a 2% to 35% mask-area range; new synthetic generation defaults to a stricter 5% to 20% range and records blur-kernel parameters in the manifest metadata. See `docs/data_status.md` for details.

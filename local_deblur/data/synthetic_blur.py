@@ -44,10 +44,12 @@ def apply_gaussian_local_blur(image: Image.Image, mask: Image.Image, radius: flo
 
 def apply_motion_local_blur(image: Image.Image, mask: Image.Image, radius: int = 9) -> Image.Image:
     radius = max(3, radius | 1)
-    kernel = np.zeros((radius, radius), dtype=np.float32)
-    kernel[radius // 2, :] = 1.0 / radius
-    flat = kernel.flatten().tolist()
-    blurred = image.convert("RGB").filter(ImageFilter.Kernel((radius, radius), flat, scale=1.0))
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    pad = radius // 2
+    padded = np.pad(arr, ((0, 0), (pad, pad), (0, 0)), mode="reflect")
+    cumsum = np.cumsum(padded, axis=1, dtype=np.float32)
+    prefix = np.pad(cumsum, ((0, 0), (1, 0), (0, 0)), mode="constant")
+    blurred = array_to_image((prefix[:, radius:, :] - prefix[:, :-radius, :]) / radius)
     return composite_masked(image.convert("RGB"), blurred, mask)
 
 
@@ -57,8 +59,26 @@ def apply_defocus_local_blur(image: Image.Image, mask: Image.Image, radius: int 
 
 
 def composite_masked(background: Image.Image, foreground: Image.Image, mask: Image.Image) -> Image.Image:
-    alpha = mask.convert("L").filter(ImageFilter.GaussianBlur(radius=1.5))
+    alpha = mask.convert("L")
     return Image.composite(foreground.convert("RGB"), background.convert("RGB"), alpha)
+
+
+def feather_mask_inward(mask: Image.Image, radius: int = 5) -> Image.Image:
+    """Feather only inside the hard mask so background pixels outside stay unchanged."""
+    radius = max(1, int(radius))
+    hard = mask.convert("L").point(lambda value: 255 if value > 0 else 0)
+    alpha = Image.new("L", hard.size, 0)
+    current = hard
+    for step in range(radius):
+        eroded = current.filter(ImageFilter.MinFilter(3))
+        ring = np.asarray(current, dtype=np.uint8) > np.asarray(eroded, dtype=np.uint8)
+        value = int(255 * (step + 1) / (radius + 1))
+        alpha_arr = np.asarray(alpha, dtype=np.uint8).copy()
+        alpha_arr[ring] = value
+        alpha = Image.fromarray(alpha_arr, mode="L")
+        current = eroded
+    alpha = Image.composite(Image.new("L", hard.size, 255), alpha, current)
+    return alpha
 
 
 def make_gradient_image(size: tuple[int, int] = (512, 512), seed: int = 0) -> Image.Image:

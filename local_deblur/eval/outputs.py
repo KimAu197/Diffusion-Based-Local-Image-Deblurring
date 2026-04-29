@@ -14,8 +14,15 @@ from local_deblur.logging_utils import configure_logging
 from local_deblur.paths import dated_result_dir
 
 
-def create_eval_output(round_name: str, model: str, dataset: str, count: int) -> tuple[Path, object]:
-    root = dated_result_dir(round_name, model, dataset, count)
+def create_eval_output(
+    round_name: str,
+    model: str,
+    dataset: str,
+    count: int,
+    *,
+    output_root: str | Path | None = None,
+) -> tuple[Path, object]:
+    root = dated_result_dir(round_name, model, dataset, count, root=output_root)
     (root / "log").mkdir(parents=True, exist_ok=True)
     logger = configure_logging("local_deblur.eval", root / "logging.log")
     return root, logger
@@ -66,8 +73,21 @@ def write_summary(
         for key in rows[0]["metrics"]:
             averages[key] = sum(row["metrics"][key] for row in rows) / len(rows)
     sample_metadata = rows[0].get("sample_metadata", {}) if rows else {}
+    first_metadata = rows[0].get("metadata", {}) if rows else {}
+    is_sd_controlnet = "ControlNet" in model or first_metadata.get("base_sd_checkpoint")
+    is_reloblur = "reloblur" in dataset.lower() or "reloblur" in str(manifest or sample_metadata.get("manifest", "")).lower()
+    if is_sd_controlnet:
+        interpretation = "Interpretation: trained SD 1.5 + Tile ControlNet local-deblur checkpoint evaluated with real diffusers img2img inference."
+        if is_reloblur:
+            limitation = "Limitation: sampled ReLoBlur test subset; use count=0 for a full ReLoBlur test-set benchmark."
+        else:
+            limitation = "Limitation: small synthetic COCO validation subset; these are not ReLoBlur benchmark results."
+    else:
+        interpretation = "Interpretation: trained ConditionalLocalDeblurNet baseline on the synthetic validation split."
+        limitation = "Limitation: these are not full diffusion/ControlNet or ReLoBlur benchmark results."
+    title = "ReLoBlur Local Deblur Evaluation Summary" if is_reloblur else "Synthetic Local Deblur Validation Summary"
     lines = [
-        "Synthetic Local Deblur Validation Summary",
+        title,
         f"model: {model}",
         f"dataset: {dataset}",
         f"manifest: {manifest or sample_metadata.get('manifest', '')}",
@@ -78,8 +98,8 @@ def write_summary(
         f"dry_run: {dry_run}",
         f"samples: {len(rows)}",
         f"image_size: {sample_metadata.get('image_size', '')}",
-        "Interpretation: trained ConditionalLocalDeblurNet baseline on the synthetic 5K validation split.",
-        "Limitation: these are not full diffusion/ControlNet or ReLoBlur benchmark results.",
+        interpretation,
+        limitation,
         "LBAG reference context: PSNR 34.71 / SSIM 0.967 (not claimed as this run's result).",
         "Mask debug metrics report whether the model identified the blurred region before restoration.",
         "",

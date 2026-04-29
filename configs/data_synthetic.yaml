@@ -15,5 +15,10 @@ synthetic:
     - gaussian
     - motion
     - defocus
+  min_mask_frac: 0.05
+  max_mask_frac: 0.25
+  gaussian_radius: 3.0
+  motion_kernel_size: 15
+  defocus_radius: 2
   preserve_background: true
   mask_centered_crop: true

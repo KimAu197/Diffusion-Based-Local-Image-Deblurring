@@ -1,20 +1,28 @@
-inference:
+evaluation:
   dry_run: false
-  output: output/inference/sd_controlnet_output.png
-  mask_output: output/inference/sd_controlnet_predicted_mask.png
+  split: all
   image_size: 256
+  visual_limit: 5
+
+inference:
   prompt: local deblur restoration
   negative_prompt: null
-  num_inference_steps: 50
-  guidance_scale: 7.5
-  strength: 0.8
-  seed: 42
+  num_inference_steps: 30
+  guidance_scale: 3.5
+  strength: 0.55
+  seed: 1234
 
-inputs:
-  image: null
-  mask: null
-  segmentation: null
-  checkpoint: null
+data:
+  manifest: output/datasets/coco2017_val_grouped_localblur_5k/manifest.json
+
+split:
+  name: all
+  split_seed: 42
+  val_fraction: 0.1
+
+model:
+  type: sd_controlnet
+  checkpoint: /root/autodl-tmp/project/output/training/phase1_sd15_tile_controlnet_coco_continue_lr5e-7_2epoch_b160/checkpoint/controlnet
 
 sd_controlnet:
   base_sd_checkpoint: /root/autodl-tmp/models/sd15-fp16
@@ -25,6 +33,7 @@ sd_controlnet:
   local_files_only: true
   dtype: float32
   precision: fp32
+  variant: fp16
   image_size: 256
   mask_head_enabled: true
   mask_head_channels: 16

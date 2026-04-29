@@ -21,11 +21,22 @@ from local_deblur.data.synthetic_blur import (
     apply_defocus_local_blur,
     apply_gaussian_local_blur,
     apply_motion_local_blur,
+    feather_mask_inward,
     make_arbitrary_mask,
     write_dry_run_artifacts,
 )
 from local_deblur.data.transforms import mask_to_array, save_image
 from local_deblur.paths import resolve_project_path
+
+
+DEFAULT_MIN_MASK_FRAC = 0.05
+DEFAULT_MAX_MASK_FRAC = 0.25
+DEFAULT_GAUSSIAN_RADIUS = 3.0
+DEFAULT_MOTION_KERNEL_SIZE = 15
+DEFAULT_DEFOCUS_RADIUS = 2
+MAX_MOTION_KERNEL_SIZE = 21
+MIN_VISIBLE_CHANGE = 0.5
+MAX_VISIBLE_CHANGE = 60.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,18 +53,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--prefer-categories",
-        default="person,car,motorcycle,bicycle,dog,bird,bus,train,truck,horse,sports ball,skateboard",
+        default="person,car,motorcycle,bicycle,bus,train,truck,dog,cat,bird,horse,sheep,cow,elephant,bear,zebra,giraffe",
         help="Comma-separated COCO categories prioritized for local motion blur.",
     )
     parser.add_argument(
         "--skip-categories",
-        default="chair,dining table,couch,bed,refrigerator",
+        default="chair,dining table,couch,bed,refrigerator,bench,potted plant,tv,laptop,book,vase",
         help="Comma-separated COCO categories to skip.",
     )
-    parser.add_argument("--min-mask-frac", type=float, default=0.02, help="Minimum mask area fraction after crop.")
-    parser.add_argument("--max-mask-frac", type=float, default=0.35, help="Maximum mask area fraction after crop.")
+    parser.add_argument(
+        "--min-mask-frac",
+        type=float,
+        default=DEFAULT_MIN_MASK_FRAC,
+        help="Minimum mask area fraction after crop; default helps match ReLoBlur-scale local regions.",
+    )
+    parser.add_argument(
+        "--max-mask-frac",
+        type=float,
+        default=DEFAULT_MAX_MASK_FRAC,
+        help="Maximum mask area fraction after crop; default keeps synthetic local blur closer to ReLoBlur-scale masks.",
+    )
     parser.add_argument("--soft-mask-radius", type=float, default=5.0, help="Gaussian feather radius for mask boundaries.")
     parser.add_argument("--blur-types", default="motion,gaussian,defocus", help="Comma-separated blur variants to mix.")
+    parser.add_argument("--gaussian-radius", type=float, default=DEFAULT_GAUSSIAN_RADIUS, help="Gaussian blur radius.")
+    parser.add_argument("--motion-kernel-size", type=int, default=DEFAULT_MOTION_KERNEL_SIZE, help="Odd motion blur kernel size.")
+    parser.add_argument("--defocus-radius", type=int, default=DEFAULT_DEFOCUS_RADIUS, help="Box blur radius for defocus blur.")
     parser.add_argument(
         "--attach-categories",
         default="backpack,handbag,umbrella,tie,suitcase,cell phone,skis,snowboard,skateboard,sports ball",
@@ -62,6 +86,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples-per-image", type=int, default=2)
     parser.add_argument("--merge-distance-frac", type=float, default=0.08)
     parser.add_argument("--edge-margin-frac", type=float, default=0.02)
+    parser.add_argument("--skip-valid", type=int, default=0, help="Skip this many valid samples before writing outputs.")
+    parser.add_argument("--sample-id-offset", type=int, default=0, help="Offset used when numbering newly written sample IDs.")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Append to output-dir/manifest.json: merge prior samples, continue group stream from next_group_index, and merge reject_counts.",
+    )
+    parser.add_argument(
+        "--start-group-index",
+        type=int,
+        default=0,
+        help="Skip this many semantic group yields before processing (used internally when --resume loads next_group_index).",
+    )
     return parser.parse_args()
 
 
@@ -163,6 +200,24 @@ def _has_black_border(image: Image.Image, threshold: int = 8, max_fraction: floa
     strips = [arr[:8, :, :], arr[-8:, :, :], arr[:, :8, :], arr[:, -8:, :]]
     black_fraction = sum(float((strip.mean(axis=-1) < threshold).mean()) for strip in strips) / len(strips)
     return black_fraction > max_fraction
+
+
+def _background_unchanged(target: Image.Image, blurred: Image.Image, hard_mask: Image.Image) -> bool:
+    target_arr = np.asarray(target.convert("RGB"))
+    blurred_arr = np.asarray(blurred.convert("RGB"))
+    outside = np.asarray(hard_mask.convert("L")) == 0
+    if not outside.any():
+        return True
+    return bool(np.array_equal(target_arr[outside], blurred_arr[outside]))
+
+
+def _masked_mean_abs_change(target: Image.Image, blurred: Image.Image, hard_mask: Image.Image) -> float:
+    target_arr = np.asarray(target.convert("RGB"), dtype=np.float32)
+    blurred_arr = np.asarray(blurred.convert("RGB"), dtype=np.float32)
+    inside = np.asarray(hard_mask.convert("L")) > 0
+    if not inside.any():
+        return 0.0
+    return float(np.abs(target_arr[inside] - blurred_arr[inside]).mean())
 
 
 def _safe_mask_centered_crop(
@@ -343,27 +398,96 @@ def _iter_semantic_coco_groups(
                 yield image_info, group, image.copy()
 
 
-def _apply_blur_variant(image: Image.Image, mask: Image.Image, blur_type: str) -> Image.Image:
+def _normalize_motion_kernel_size(kernel_size: int) -> int:
+    kernel_size = max(3, kernel_size | 1)
+    if kernel_size > MAX_MOTION_KERNEL_SIZE:
+        raise ValueError(f"motion kernel size must be <= {MAX_MOTION_KERNEL_SIZE}, got {kernel_size}")
+    return kernel_size
+
+
+def _blur_variant_metadata(
+    blur_type: str,
+    *,
+    gaussian_radius: float,
+    motion_kernel_size: int,
+    defocus_radius: int,
+) -> dict[str, float | int | str]:
     if blur_type == "gaussian":
-        return apply_gaussian_local_blur(image, mask, radius=5.0)
+        return {"blur_model": "gaussian", "gaussian_radius": gaussian_radius}
     if blur_type == "motion":
-        return apply_motion_local_blur(image, mask, radius=5)
-    return apply_defocus_local_blur(image, mask, radius=4)
+        return {"blur_model": "motion", "motion_kernel_size": _normalize_motion_kernel_size(motion_kernel_size)}
+    if blur_type == "defocus":
+        return {"blur_model": "defocus", "defocus_radius": max(1, defocus_radius)}
+    raise ValueError(f"Unsupported blur type: {blur_type}")
 
 
-def write_coco_synthetic_artifacts(source: Path, output_dir: Path, *, count: int, size: int, seed: int) -> list[dict[str, str]]:
+def _apply_blur_variant(
+    image: Image.Image,
+    mask: Image.Image,
+    blur_type: str,
+    *,
+    gaussian_radius: float,
+    motion_kernel_size: int,
+    defocus_radius: int,
+) -> Image.Image:
+    if blur_type == "gaussian":
+        return apply_gaussian_local_blur(image, mask, radius=gaussian_radius)
+    if blur_type == "motion":
+        return apply_motion_local_blur(image, mask, radius=_normalize_motion_kernel_size(motion_kernel_size))
+    if blur_type == "defocus":
+        return apply_defocus_local_blur(image, mask, radius=defocus_radius)
+    raise ValueError(f"Unsupported blur type: {blur_type}")
+
+
+def write_coco_synthetic_artifacts(
+    source: Path,
+    output_dir: Path,
+    *,
+    count: int,
+    size: int,
+    seed: int,
+    gaussian_radius: float,
+    motion_kernel_size: int,
+    defocus_radius: int,
+    skip_valid: int = 0,
+    sample_id_offset: int = 0,
+) -> tuple[list[dict[str, str]], dict[str, int]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, str]] = []
+    reject_counts: dict[str, int] = defaultdict(int)
     limit = None if count == 0 else max(1, count)
+    valid_seen = 0
     for index, (source_id, image) in enumerate(_iter_image_records(source)):
         if limit is not None and len(records) >= limit:
             break
-        sample_id = f"coco_synth_{index:06d}"
         mask = make_arbitrary_mask(image.size, seed=seed + index)
         target, mask, segmentation, _ = mask_centered_crop(image, mask, size=size, segmentation=mask, target=None)
         if target is None or mask is None:
+            reject_counts["crop_failed"] += 1
             continue
-        blurred = _apply_blur_variant(target, mask, ["gaussian", "motion", "defocus"][index % 3])
+        if valid_seen < skip_valid:
+            valid_seen += 1
+            continue
+        sample_id = f"coco_synth_{sample_id_offset + len(records):06d}"
+        blur_type = ["gaussian", "motion", "defocus"][index % 3]
+        blurred = _apply_blur_variant(
+            target,
+            mask,
+            blur_type,
+            gaussian_radius=gaussian_radius,
+            motion_kernel_size=motion_kernel_size,
+            defocus_radius=defocus_radius,
+        )
+        mean_abs_change = _masked_mean_abs_change(target, blurred, mask)
+        if mean_abs_change < MIN_VISIBLE_CHANGE or mean_abs_change > MAX_VISIBLE_CHANGE:
+            reject_counts["blur_strength_failed"] += 1
+            continue
+        if not _background_unchanged(target, blurred, mask):
+            reject_counts["background_changed"] += 1
+            continue
+        if _has_black_border(blurred):
+            reject_counts["black_border"] += 1
+            continue
         segmentation = segmentation or mask
 
         sample_dir = output_dir / sample_id
@@ -383,13 +507,25 @@ def write_coco_synthetic_artifacts(source: Path, output_dir: Path, *, count: int
                     "source": "coco",
                     "source_id": source_id,
                     "mask_mean": float(mask_to_array(mask).mean()),
-                    "blur_variant": ["gaussian", "motion", "defocus"][index % 3],
+                    "blur_variant": blur_type,
+                    "blur_params": _blur_variant_metadata(
+                        blur_type,
+                        gaussian_radius=gaussian_radius,
+                        motion_kernel_size=motion_kernel_size,
+                        defocus_radius=defocus_radius,
+                    ),
+                    "quality_checks": {
+                        "background_unchanged": True,
+                        "mean_abs_change": mean_abs_change,
+                        "no_black_border": True,
+                    },
                 },
             }
         )
+        valid_seen += 1
     if not records:
         raise RuntimeError(f"No images were processed from {source}")
-    return records
+    return records, dict(reject_counts)
 
 
 def write_coco_semantic_artifacts(
@@ -397,6 +533,8 @@ def write_coco_semantic_artifacts(
     annotation_source: Path,
     output_dir: Path,
     *,
+    start_group_index: int,
+    existing_keys: set[tuple[str, tuple[int, ...]]],
     count: int,
     size: int,
     seed: int,
@@ -407,14 +545,23 @@ def write_coco_semantic_artifacts(
     max_mask_frac: float,
     soft_mask_radius: float,
     blur_types: list[str],
+    gaussian_radius: float,
+    motion_kernel_size: int,
+    defocus_radius: int,
     attach_categories: set[str],
     max_samples_per_image: int,
     merge_distance_frac: float,
     edge_margin_frac: float,
-) -> list[dict[str, str]]:
+    skip_valid: int = 0,
+    sample_id_offset: int = 0,
+) -> tuple[list[dict[str, str]], dict[str, int], int, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, str]] = []
+    reject_counts: dict[str, int] = defaultdict(int)
     limit = None if count == 0 else max(1, count)
+    valid_seen = 0
+    groups_seen = 0
+    last_index = start_group_index - 1
     for index, (image_info, group, image) in enumerate(
         _iter_semantic_coco_groups(
             image_source,
@@ -426,23 +573,52 @@ def write_coco_semantic_artifacts(
             max_samples_per_image=max_samples_per_image,
             merge_distance_frac=merge_distance_frac,
             edge_margin_frac=edge_margin_frac,
-        )
+        ),
+        start=start_group_index,
     ):
+        last_index = index
+        groups_seen += 1
         if limit is not None and len(records) >= limit:
             break
+        key = (Path(image_info["file_name"]).stem, tuple(sorted(int(x) for x in dict.fromkeys(group["annotation_ids"]))))
+        if key in existing_keys:
+            reject_counts["resume_duplicate_skip"] += 1
+            continue
         crop_result = _safe_mask_centered_crop(image, group["mask"], size=size, segmentation=group["mask"])
         if crop_result is None:
+            reject_counts["crop_or_black_border_failed"] += 1
             continue
         target, crop_mask, segmentation = crop_result
         mask_mean = float(mask_to_array(crop_mask).mean())
         if mask_mean < min_mask_frac or mask_mean > max_mask_frac:
+            reject_counts["mask_area_failed"] += 1
             continue
-        soft_mask = crop_mask.filter(ImageFilter.GaussianBlur(radius=soft_mask_radius))
+        if valid_seen < skip_valid:
+            valid_seen += 1
+            continue
+        soft_mask = feather_mask_inward(crop_mask, radius=int(soft_mask_radius))
         segmentation = segmentation or crop_mask
         blur_type = blur_types[(seed + index) % len(blur_types)]
-        blurred = _apply_blur_variant(target, soft_mask, blur_type)
+        blurred = _apply_blur_variant(
+            target,
+            soft_mask,
+            blur_type,
+            gaussian_radius=gaussian_radius,
+            motion_kernel_size=motion_kernel_size,
+            defocus_radius=defocus_radius,
+        )
+        mean_abs_change = _masked_mean_abs_change(target, blurred, crop_mask)
+        if mean_abs_change < MIN_VISIBLE_CHANGE or mean_abs_change > MAX_VISIBLE_CHANGE:
+            reject_counts["blur_strength_failed"] += 1
+            continue
+        if not _background_unchanged(target, blurred, crop_mask):
+            reject_counts["background_changed"] += 1
+            continue
+        if _has_black_border(blurred):
+            reject_counts["black_border"] += 1
+            continue
 
-        sample_id = f"coco_semantic_{len(records):06d}"
+        sample_id = f"coco_semantic_{sample_id_offset + len(records):06d}"
         sample_dir = output_dir / sample_id
         sample_dir.mkdir(parents=True, exist_ok=True)
         blurred_path = save_image(blurred, sample_dir / "Ib.png")
@@ -463,23 +639,65 @@ def write_coco_semantic_artifacts(
                     "categories": list(dict.fromkeys(group["categories"])),
                     "category": "+".join(sorted(set(group["categories"]))),
                     "mask_mean": mask_mean,
+                    "group_index": index,
                     "blur_variant": blur_type,
+                    "blur_params": _blur_variant_metadata(
+                        blur_type,
+                        gaussian_radius=gaussian_radius,
+                        motion_kernel_size=motion_kernel_size,
+                        defocus_radius=defocus_radius,
+                    ),
                     "semantic_mask": True,
                     "grouped_motion_object": True,
                     "soft_mask_radius": soft_mask_radius,
+                    "quality_checks": {
+                        "background_unchanged": True,
+                        "mask_area_min": min_mask_frac,
+                        "mask_area_max": max_mask_frac,
+                        "mean_abs_change": mean_abs_change,
+                        "no_black_border": True,
+                        "feather_mode": "inward_distance",
+                    },
                 },
             }
         )
+        existing_keys.add(key)
+        valid_seen += 1
+    next_group_index = last_index + 1
+    if not records and limit is None:
+        return [], dict(reject_counts), groups_seen, next_group_index
     if not records:
         raise RuntimeError(f"No semantic COCO samples were processed from {image_source}")
-    return records
+    return records, dict(reject_counts), groups_seen, next_group_index
+
+
+def _manifest_instance_keys(samples: list[dict[str, str]]) -> set[tuple[str, tuple[int, ...]]]:
+    keys: set[tuple[str, tuple[int, ...]]] = set()
+    for row in samples:
+        meta = row.get("metadata", {})
+        source_id = meta.get("source_id")
+        annotation_ids = meta.get("annotation_ids")
+        if not source_id or not isinstance(annotation_ids, list):
+            continue
+        ids = tuple(sorted(int(x) for x in annotation_ids))
+        keys.add((str(source_id), ids))
+    return keys
 
 
 def main() -> None:
     args = parse_args()
     output_dir = resolve_project_path(args.output_dir)
+    prior_samples: list[dict[str, str]] = []
+    prior_generation: dict | None = None
+    prior_reject: dict[str, int] = {}
+    start_group_index = max(0, args.start_group_index)
+    records: list[dict[str, str]] = []
+    reject_counts: dict[str, int] = {}
+    groups_seen = 0
+    next_group_index = 0
     if args.dry_run:
         records = write_dry_run_artifacts(output_dir, count=args.count, size=args.image_size)
+        reject_counts = {}
     else:
         if not args.coco_images:
             raise SystemExit("--coco-images is required unless --dry-run is used")
@@ -488,10 +706,39 @@ def main() -> None:
             skip_categories = {item.strip() for item in args.skip_categories.split(",") if item.strip()}
             attach_categories = {item.strip() for item in args.attach_categories.split(",") if item.strip()}
             blur_types = [item.strip() for item in args.blur_types.split(",") if item.strip()]
-            records = write_coco_semantic_artifacts(
+            if not blur_types:
+                raise SystemExit("--blur-types must include at least one blur variant")
+            for blur_type in blur_types:
+                _blur_variant_metadata(
+                    blur_type,
+                    gaussian_radius=args.gaussian_radius,
+                    motion_kernel_size=args.motion_kernel_size,
+                    defocus_radius=args.defocus_radius,
+                )
+            manifest_path = output_dir / "manifest.json"
+            sample_id_offset = args.sample_id_offset
+            existing_keys: set[tuple[str, tuple[int, ...]]] = set()
+            if args.resume:
+                if not manifest_path.is_file():
+                    raise SystemExit(f"--resume requires existing manifest at {manifest_path}")
+                prior_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                prior_samples = prior_payload.get("samples", [])
+                prior_generation = prior_payload.get("generation")
+                if isinstance(prior_generation, dict) and "reject_counts" in prior_generation:
+                    prior_reject = dict(prior_generation["reject_counts"])
+                existing_keys = _manifest_instance_keys(prior_samples)
+                if args.start_group_index != 0:
+                    start_group_index = max(0, args.start_group_index)
+                elif (prior_generation or {}).get("next_group_index") is not None:
+                    start_group_index = int((prior_generation or {}).get("next_group_index", start_group_index))
+                if args.sample_id_offset == 0:
+                    sample_id_offset = len(prior_samples)
+            records, reject_counts, groups_seen, next_group_index = write_coco_semantic_artifacts(
                 Path(args.coco_images),
                 Path(args.coco_instances),
                 output_dir,
+                start_group_index=start_group_index,
+                existing_keys=existing_keys,
                 count=args.count,
                 size=args.image_size,
                 seed=args.seed,
@@ -502,16 +749,59 @@ def main() -> None:
                 max_mask_frac=args.max_mask_frac,
                 soft_mask_radius=args.soft_mask_radius,
                 blur_types=blur_types,
+                gaussian_radius=args.gaussian_radius,
+                motion_kernel_size=args.motion_kernel_size,
+                defocus_radius=args.defocus_radius,
                 attach_categories=attach_categories,
                 max_samples_per_image=args.max_samples_per_image,
                 merge_distance_frac=args.merge_distance_frac,
                 edge_margin_frac=args.edge_margin_frac,
+                skip_valid=args.skip_valid,
+                sample_id_offset=sample_id_offset,
             )
         else:
-            records = write_coco_synthetic_artifacts(Path(args.coco_images), output_dir, count=args.count, size=args.image_size, seed=args.seed)
+            records, reject_counts = write_coco_synthetic_artifacts(
+                Path(args.coco_images),
+                output_dir,
+                count=args.count,
+                size=args.image_size,
+                seed=args.seed,
+                gaussian_radius=args.gaussian_radius,
+                motion_kernel_size=args.motion_kernel_size,
+                defocus_radius=args.defocus_radius,
+                skip_valid=args.skip_valid,
+                sample_id_offset=args.sample_id_offset,
+            )
+            groups_seen = 0
+            next_group_index = 0
     manifest = output_dir / "manifest.json"
-    manifest.write_text(json.dumps({"samples": records}, indent=2), encoding="utf-8")
-    print(f"Wrote {len(records)} samples")
+    merged_reject = dict(prior_reject)
+    for key, value in reject_counts.items():
+        merged_reject[key] = merged_reject.get(key, 0) + int(value)
+    semantic_run = not args.dry_run and bool(args.coco_instances)
+    all_samples = prior_samples + records if args.resume and semantic_run else records
+    manifest_payload = {
+        "generation": {
+            "min_mask_frac": args.min_mask_frac,
+            "max_mask_frac": args.max_mask_frac,
+            "blur_types": [item.strip() for item in args.blur_types.split(",") if item.strip()],
+            "gaussian_radius": args.gaussian_radius,
+            "motion_kernel_size": _normalize_motion_kernel_size(args.motion_kernel_size),
+            "max_motion_kernel_size": MAX_MOTION_KERNEL_SIZE,
+            "defocus_radius": max(1, args.defocus_radius),
+            "feather_mode": "inward_distance",
+            "preserve_background_outside_hard_mask": True,
+            "reject_counts": merged_reject,
+            "next_group_index": next_group_index if semantic_run else 0,
+            "groups_seen_this_run": groups_seen if semantic_run else 0,
+        },
+        "samples": all_samples,
+    }
+    manifest.write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
+    print(f"Wrote {len(records)} new samples ({len(all_samples)} total in manifest)")
+    print(f"Reject counts (this run): {reject_counts}")
+    print(f"Reject counts (merged): {merged_reject}")
+    print(f"next_group_index: {manifest_payload['generation'].get('next_group_index')}")
     print(f"Manifest: {manifest}")
 
 

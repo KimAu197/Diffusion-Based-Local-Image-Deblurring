@@ -24,20 +24,28 @@ def ensure_directory(path: str | Path) -> Path:
     return directory
 
 
-def dated_result_dir(round_name: str, model: str, dataset: str, count: int | str) -> Path:
+def dated_result_dir(
+    round_name: str,
+    model: str,
+    dataset: str,
+    count: int | str,
+    *,
+    root: str | Path | None = None,
+) -> Path:
     """Create results/<ROUND>_<MODEL>_<DATASET>_<COUNT>_<MMDD>[_HHMM]."""
     date_part = datetime.now().strftime("%m%d")
     safe = "_".join(str(part).replace("/", "-").replace(" ", "-") for part in (round_name, model, dataset, count, date_part))
-    base = PROJECT_ROOT / "results" / safe
+    output_root = resolve_project_path(root) if root is not None else PROJECT_ROOT / "results"
+    base = output_root / safe
     if not base.exists():
         base.mkdir(parents=True)
         return base
 
     suffix = datetime.now().strftime("%H%M")
-    candidate = PROJECT_ROOT / "results" / f"{safe}_{suffix}"
+    candidate = output_root / f"{safe}_{suffix}"
     index = 1
     while candidate.exists():
-        candidate = PROJECT_ROOT / "results" / f"{safe}_{suffix}_{index}"
+        candidate = output_root / f"{safe}_{suffix}_{index}"
         index += 1
     candidate.mkdir(parents=True)
     return candidate

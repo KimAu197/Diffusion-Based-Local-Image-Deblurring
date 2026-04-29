@@ -26,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--visual-limit", type=int, default=12)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--model-type", choices=["baseline", "sd_controlnet"], default=None)
+    parser.add_argument("--output-root", default=None)
     return parser.parse_args()
 
 
@@ -43,7 +45,7 @@ def main() -> None:
     split_seed = int(args.split_seed if args.split_seed is not None else split_config.get("split_seed", 42))
     image_size = int(args.image_size if args.image_size is not None else evaluation_config.get("image_size", 512))
 
-    output_dir, logger = create_eval_output(args.round_name, args.model, args.dataset, args.count)
+    output_dir, logger = create_eval_output(args.round_name, args.model, args.dataset, args.count, output_root=args.output_root)
     logger.info("starting evaluation args=%s", vars(args))
     logger.info(
         "resolved manifest=%s checkpoint=%s split=%s split_seed=%s val_fraction=%s image_size=%s dry_run=%s",
@@ -65,7 +67,13 @@ def main() -> None:
         split_seed=split_seed,
         image_size=image_size,
     )
-    pipeline = build_eval_model(checkpoint=checkpoint, dry_run=args.dry_run, device=args.device)
+    pipeline = build_eval_model(
+        checkpoint=checkpoint,
+        dry_run=args.dry_run,
+        device=args.device,
+        config=config,
+        model_type=args.model_type or model_config.get("type"),
+    )
 
     rows = []
     for sample in dataset:

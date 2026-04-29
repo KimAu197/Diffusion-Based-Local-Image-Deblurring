@@ -12,3 +12,4 @@ safetensors
 huggingface_hub
 gdown
 scikit-image
+wandb

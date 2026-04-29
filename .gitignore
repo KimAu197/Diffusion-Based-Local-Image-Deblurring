@@ -1,7 +1,16 @@
+# Environment
 .env
+
+# Cursor IDE (local state / runtime data)
+.cursor/
+
+# Generated outputs and artifacts
 cache/
 output/
 results/
+
+# Misc
 *.log
 *.pyc
 *.tmp
+data/
