@@ -1,3 +1,0 @@
-# learn-what-you-learn helpers (YouTube, optional Notion scripts)
-youtube-transcript-api
-notion-client

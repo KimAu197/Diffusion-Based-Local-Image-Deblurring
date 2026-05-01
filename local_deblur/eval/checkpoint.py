@@ -10,6 +10,7 @@ from PIL import Image
 from local_deblur.data.tensor_dataset import sample_to_tensors
 from local_deblur.data.transforms import array_to_image
 from local_deblur.data.types import LocalDeblurSample
+from local_deblur.models.nafnet_preprocess import ModelScopeNAFNetMaskPreprocessor
 from local_deblur.models.pipeline import LocalDeblurPipeline, PipelineOutput
 from local_deblur.models.postprocess import smooth_boundary
 from local_deblur.models.sd_controlnet import SDControlNetConfig, StableDiffusionControlNetLocalDeblurPipeline
@@ -84,10 +85,57 @@ class SDControlNetCheckpointEvaluator:
         self.strength = float(config.get("inference", {}).get("strength", 0.8))
         self.seed = config.get("inference", {}).get("seed")
         self.preserve_background = bool(config.get("runtime", {}).get("preserve_background", True))
+        self.nafnet_preprocessor = ModelScopeNAFNetMaskPreprocessor.from_config(config.get("nafnet_preprocess"))
+        self.use_gt_mask_as_input = bool(config.get("runtime", {}).get("use_gt_mask_as_input", False))
+        self.mask_predictor = None
+        self.mask_predictor_threshold = float(config.get("runtime", {}).get("mask_predictor_threshold", 0.5))
+        self.mask_predictor_input_features = str(config.get("runtime", {}).get("mask_predictor_input_features", "rgb"))
+        mask_predictor_checkpoint = config.get("runtime", {}).get("mask_predictor_checkpoint")
+        if mask_predictor_checkpoint:
+            self._load_mask_predictor(mask_predictor_checkpoint, device=device or sd_config.get("device"))
         self.pipeline = StableDiffusionControlNetLocalDeblurPipeline.from_config(
             SDControlNetConfig.from_dict(sd_config),
             load_checkpoints=True,
         )
+
+    def _load_mask_predictor(self, checkpoint: str, device: str | None = None) -> None:
+        import torch
+
+        from local_deblur.models.mask_predictor import MaskPredictorUNet
+
+        path = Path(checkpoint)
+        if not path.exists():
+            raise FileNotFoundError(f"Mask predictor checkpoint not found: {path}")
+        resolved_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        payload: dict[str, Any] = torch.load(path, map_location="cpu")
+        model = MaskPredictorUNet(
+            in_channels=int(payload.get("in_channels", 3)),
+            base_channels=int(payload.get("base_channels", 16)),
+        ).to(resolved_device)
+        model.load_state_dict(payload["model_state_dict"], strict=True)
+        model.eval()
+        self.mask_predictor = model
+        self.mask_predictor_device = resolved_device
+        self.mask_predictor_checkpoint = str(path)
+
+    def _predict_stage1_mask(self, sample: LocalDeblurSample) -> Image.Image:
+        import torch
+
+        from local_deblur.data.tensor_dataset import sample_to_tensors
+        from local_deblur.data.transforms import array_to_image
+        from local_deblur.training.mask_stage1 import build_mask_predictor_input
+
+        if self.mask_predictor is None:
+            raise RuntimeError("Stage 1 mask predictor is not loaded")
+        item = sample_to_tensors(sample, image_size=self.pipeline.config.image_size, include_segmentation=False)
+        features = build_mask_predictor_input(
+            item["Ib"].unsqueeze(0).to(self.mask_predictor_device),
+            self.mask_predictor_input_features,
+        )
+        with torch.no_grad():
+            mask_prob = self.mask_predictor(features).mask_prob[0, 0].detach().float().cpu().numpy()
+        mask = (mask_prob >= self.mask_predictor_threshold).astype("float32")
+        return array_to_image(mask).convert("L").resize(sample.blurred.size)
 
     def _generator(self):
         if self.seed is None:
@@ -97,7 +145,105 @@ class SDControlNetCheckpointEvaluator:
         device = self.pipeline.config.device or ("cuda" if torch.cuda.is_available() else "cpu")
         return torch.Generator(device=device).manual_seed(int(self.seed))
 
+    def _apply_nafnet(self, image: Image.Image, mask: Image.Image, sample_id: str) -> Image.Image:
+        if self.nafnet_preprocessor is None:
+            return image
+        return self.nafnet_preprocessor.process(image, mask, sample_id=sample_id)
+
     def __call__(self, sample: LocalDeblurSample, **_: Any) -> PipelineOutput:
+        if self.use_gt_mask_as_input:
+            stage2_image = self._apply_nafnet(sample.blurred, sample.mask, sample.sample_id)
+            inference_sample = LocalDeblurSample(
+                sample_id=sample.sample_id,
+                blurred=stage2_image,
+                mask=sample.mask,
+                target=sample.target,
+                segmentation=sample.mask,
+                metadata=sample.metadata,
+            )
+            result = self.pipeline(
+                inference_sample,
+                prompt=self.prompt,
+                negative_prompt=self.negative_prompt,
+                num_inference_steps=self.num_inference_steps,
+                guidance_scale=self.guidance_scale,
+                strength=self.strength,
+                generator=self._generator(),
+            )
+            restored = result.images[0] if hasattr(result, "images") else result
+            if self.preserve_background:
+                input_image = stage2_image.resize(restored.size)
+                mask = sample.mask.resize(restored.size)
+                restored = smooth_boundary(input_image, restored, mask)
+            return PipelineOutput(
+                image=restored,
+                predicted_mask=sample.mask,
+                metadata={
+                    "used_fallback": False,
+                    "checkpoint": self.pipeline.config.controlnet_checkpoint,
+                    "base_sd_checkpoint": self.pipeline.config.base_sd_checkpoint,
+                    "mask_head_checkpoint": self.pipeline.config.mask_head_checkpoint,
+                    "num_inference_steps": self.num_inference_steps,
+                    "guidance_scale": self.guidance_scale,
+                    "strength": self.strength,
+                    "seed": self.seed,
+                    "preserve_background": self.preserve_background,
+                    "nafnet_preprocess": self.nafnet_preprocessor is not None,
+                    "predicts_blur_mask": False,
+                    "uses_gt_mask_as_input": True,
+                    "mask_source": "ground_truth",
+                    "mask_head": None,
+                },
+            )
+
+        if self.mask_predictor is not None:
+            inference_mask = self._predict_stage1_mask(sample)
+            stage2_image = self._apply_nafnet(sample.blurred, inference_mask, sample.sample_id)
+            inference_sample = LocalDeblurSample(
+                sample_id=sample.sample_id,
+                blurred=stage2_image,
+                mask=inference_mask,
+                target=sample.target,
+                segmentation=inference_mask,
+                metadata=sample.metadata,
+            )
+            result = self.pipeline(
+                inference_sample,
+                prompt=self.prompt,
+                negative_prompt=self.negative_prompt,
+                num_inference_steps=self.num_inference_steps,
+                guidance_scale=self.guidance_scale,
+                strength=self.strength,
+                generator=self._generator(),
+            )
+            restored = result.images[0] if hasattr(result, "images") else result
+            if self.preserve_background:
+                input_image = stage2_image.resize(restored.size)
+                mask = inference_mask.resize(restored.size)
+                restored = smooth_boundary(input_image, restored, mask)
+            return PipelineOutput(
+                image=restored,
+                predicted_mask=inference_mask,
+                metadata={
+                    "used_fallback": False,
+                    "checkpoint": self.pipeline.config.controlnet_checkpoint,
+                    "base_sd_checkpoint": self.pipeline.config.base_sd_checkpoint,
+                    "mask_head_checkpoint": self.pipeline.config.mask_head_checkpoint,
+                    "num_inference_steps": self.num_inference_steps,
+                    "guidance_scale": self.guidance_scale,
+                    "strength": self.strength,
+                    "seed": self.seed,
+                    "preserve_background": self.preserve_background,
+                    "nafnet_preprocess": self.nafnet_preprocessor is not None,
+                    "predicts_blur_mask": True,
+                    "uses_gt_mask_as_input": False,
+                    "mask_source": "stage1_mask_predictor",
+                    "mask_predictor_checkpoint": self.mask_predictor_checkpoint,
+                    "mask_predictor_threshold": self.mask_predictor_threshold,
+                    "mask_head": None,
+                },
+            )
+
         blank_mask = Image.new("L", sample.blurred.size, color=0)
         input_sample = LocalDeblurSample(
             sample_id=sample.sample_id,
@@ -117,9 +263,10 @@ class SDControlNetCheckpointEvaluator:
             predicted_mask = array_to_image(mask_prob.numpy()).convert("L")
 
         inference_mask = predicted_mask.resize(sample.blurred.size) if predicted_mask is not None else blank_mask
+        stage2_image = self._apply_nafnet(sample.blurred, inference_mask, sample.sample_id)
         inference_sample = LocalDeblurSample(
             sample_id=sample.sample_id,
-            blurred=sample.blurred,
+            blurred=stage2_image,
             mask=inference_mask,
             target=sample.target,
             segmentation=inference_mask,
@@ -136,7 +283,7 @@ class SDControlNetCheckpointEvaluator:
         )
         restored = result.images[0] if hasattr(result, "images") else result
         if self.preserve_background:
-            input_image = sample.blurred.resize(restored.size)
+            input_image = stage2_image.resize(restored.size)
             mask = inference_mask.resize(restored.size)
             restored = smooth_boundary(input_image, restored, mask)
 
@@ -153,6 +300,7 @@ class SDControlNetCheckpointEvaluator:
                 "strength": self.strength,
                 "seed": self.seed,
                 "preserve_background": self.preserve_background,
+                "nafnet_preprocess": self.nafnet_preprocessor is not None,
                 "predicts_blur_mask": predicted_mask is not None,
                 "uses_gt_mask_as_input": False,
                 "mask_head": "ControlNetAuxMaskHead",

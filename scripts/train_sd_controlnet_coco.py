@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
 import random
 import shutil
@@ -25,6 +26,7 @@ from local_deblur.data.datasets import ManifestDeblurDataset
 from local_deblur.data.tensor_dataset import deterministic_split_indices, sample_to_tensors
 from local_deblur.data.types import LocalDeblurSample
 from local_deblur.logging_utils import configure_logging
+from local_deblur.models.nafnet_preprocess import ModelScopeNAFNetMaskPreprocessor
 from local_deblur.models.sd_controlnet import ControlNetAuxMaskHead, build_controlnet_condition_from_sample
 from local_deblur.paths import resolve_project_path
 from local_deblur.training.sd_controlnet import auxiliary_mask_head_loss
@@ -52,6 +54,7 @@ class SDControlNetCocoDataset:
         training: bool = False,
         bapc_probability: float = 0.0,
         bapc_min_mask_ratio: float = 0.05,
+        nafnet_preprocess_config: dict[str, Any] | None = None,
     ):
         self.dataset = ManifestDeblurDataset(manifest)
         self.indices = list(indices)
@@ -59,6 +62,7 @@ class SDControlNetCocoDataset:
         self.training = training
         self.bapc_probability = float(bapc_probability)
         self.bapc_min_mask_ratio = float(bapc_min_mask_ratio)
+        self.nafnet_preprocessor = ModelScopeNAFNetMaskPreprocessor.from_config(nafnet_preprocess_config)
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -108,6 +112,29 @@ class SDControlNetCocoDataset:
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self.dataset[self.indices[index]]
         sample = self._crop_sample(sample)
+        if self.nafnet_preprocessor is not None:
+            metadata = dict(sample.metadata or {})
+            processed = self.nafnet_preprocessor.process(
+                sample.blurred,
+                sample.mask,
+                sample_id=sample.sample_id,
+                crop_box=metadata.get("crop_box"),
+            )
+            metadata.update(
+                {
+                    "nafnet_preprocess": "modelscope_gopro_width64_direct_mask_soft_boundary",
+                    "nafnet_model_dir": self.nafnet_preprocessor.model_dir,
+                    "nafnet_mask_blur_radius": self.nafnet_preprocessor.mask_blur_radius,
+                }
+            )
+            sample = LocalDeblurSample(
+                sample_id=sample.sample_id,
+                blurred=processed,
+                mask=sample.mask,
+                target=sample.target,
+                segmentation=sample.segmentation,
+                metadata=metadata,
+            )
         item = sample_to_tensors(sample, image_size=self.image_size, include_segmentation=True)
         condition = build_controlnet_condition_from_sample(sample, image_size=self.image_size)
         import torch
@@ -285,6 +312,7 @@ def prepare_datasets(config: dict[str, Any], args: argparse.Namespace) -> tuple[
     image_size = int(data_config.get("image_size", 64))
     bapc_probability = float(data_config.get("bapc_probability", 0.0))
     bapc_min_mask_ratio = float(data_config.get("bapc_min_mask_ratio", 0.05))
+    nafnet_preprocess_config = config.get("nafnet_preprocess")
     metadata = {
         "manifest": str(manifest),
         "validation_manifest": str(val_manifest),
@@ -306,8 +334,15 @@ def prepare_datasets(config: dict[str, Any], args: argparse.Namespace) -> tuple[
             training=True,
             bapc_probability=bapc_probability,
             bapc_min_mask_ratio=bapc_min_mask_ratio,
+            nafnet_preprocess_config=nafnet_preprocess_config,
         ),
-        SDControlNetCocoDataset(val_manifest, indices=val_indices, image_size=image_size, training=False),
+        SDControlNetCocoDataset(
+            val_manifest,
+            indices=val_indices,
+            image_size=image_size,
+            training=False,
+            nafnet_preprocess_config=nafnet_preprocess_config,
+        ),
         metadata,
     )
 
@@ -327,19 +362,37 @@ def encode_prompt(pipe: Any, prompt: str, batch_size: int, device: Any):
         return pipe.text_encoder(input_ids)[0]
 
 
-def diffusion_step(pipe: Any, controlnet: Any, batch: dict[str, Any], prompt: str, device: Any, dtype: Any):
+def diffusion_step(
+    pipe: Any,
+    controlnet: Any,
+    batch: dict[str, Any],
+    prompt: str,
+    device: Any,
+    dtype: Any,
+    *,
+    loss_mode: str = "full",
+    mask_weight_scale: float = 0.0,
+    timestep_min: int = 0,
+    timestep_max: int | None = None,
+):
     import torch
     import torch.nn.functional as F
 
     target = batch["target"].to(device=device, dtype=dtype)
     condition = batch["controlnet_condition"].to(device=device, dtype=dtype)
+    normalized_loss_mode = str(loss_mode or "full").lower()
     with torch.no_grad():
         latents = pipe.vae.encode(target * 2.0 - 1.0).latent_dist.sample()
         latents = latents * pipe.vae.config.scaling_factor
         noise = torch.randn_like(latents)
+        scheduler_steps = int(pipe.scheduler.config.num_train_timesteps)
+        low = max(0, int(timestep_min))
+        high = scheduler_steps if timestep_max is None else min(scheduler_steps, int(timestep_max) + 1)
+        if low >= high:
+            raise ValueError(f"Invalid timestep range [{low}, {high - 1}] for scheduler steps={scheduler_steps}")
         timesteps = torch.randint(
-            0,
-            pipe.scheduler.config.num_train_timesteps,
+            low,
+            high,
             (latents.shape[0],),
             device=device,
             dtype=torch.long,
@@ -360,13 +413,26 @@ def diffusion_step(pipe: Any, controlnet: Any, batch: dict[str, Any], prompt: st
         down_block_additional_residuals=down_res,
         mid_block_additional_residual=mid_res,
     ).sample
+    if normalized_loss_mode in {"mask_weighted", "mask_only"}:
+        mask = batch["M"].to(device=device, dtype=torch.float32)
+        latent_mask = F.interpolate(mask, size=noise_pred.shape[-2:], mode="nearest")
+        weights = latent_mask.expand_as(noise_pred.float())
+        denom = weights.sum().clamp_min(1.0)
+        return ((noise_pred.float() - noise.float()).pow(2) * weights).sum() / denom
+    if normalized_loss_mode in {"mask_weighted_full", "full_mask_weighted", "mask_amplified"}:
+        mask = batch["M"].to(device=device, dtype=torch.float32)
+        latent_mask = F.interpolate(mask, size=noise_pred.shape[-2:], mode="nearest")
+        weights = (1.0 + float(mask_weight_scale) * latent_mask).expand_as(noise_pred.float())
+        return ((noise_pred.float() - noise.float()).pow(2) * weights).sum() / weights.sum().clamp_min(1.0)
+    if normalized_loss_mode != "full":
+        raise ValueError(f"Unsupported diffusion_loss_mode: {loss_mode}")
     return F.mse_loss(noise_pred.float(), noise.float())
 
 
 def evaluate_validation_loss(
     pipe: Any,
     controlnet: Any,
-    mask_head: Any,
+    mask_head: Any | None,
     val_loader: Any,
     device: Any,
     dtype: Any,
@@ -375,37 +441,54 @@ def evaluate_validation_loss(
     mask_loss_kwargs: dict[str, float],
     diffusion_weight: float,
     mask_weight: float,
+    diffusion_loss_mode: str,
+    diffusion_mask_weight_scale: float,
+    timestep_min: int,
+    timestep_max: int | None,
 ) -> dict[str, float]:
     import torch
 
     controlnet.eval()
-    mask_head.eval()
+    if mask_head is not None:
+        mask_head.eval()
     totals = {
         "val_total_loss": 0.0,
         "val_diffusion_loss": 0.0,
-        "val_mask_loss": 0.0,
-        "val_mask_bce": 0.0,
-        "val_mask_dice": 0.0,
     }
+    if mask_head is not None:
+        totals.update({"val_mask_loss": 0.0, "val_mask_bce": 0.0, "val_mask_dice": 0.0})
     batches = 0
     with torch.no_grad():
         for batch in val_loader:
-            diffusion_loss = diffusion_step(pipe, controlnet, batch, prompt, device, dtype)
-            condition = batch["controlnet_condition"].to(device=device, dtype=torch.float32)
-            mask = batch["M"].to(device=device, dtype=torch.float32)
-            output = mask_head(condition)
-            terms = auxiliary_mask_head_loss(output.mask_logits, mask, **mask_loss_kwargs)
-            total_loss = diffusion_weight * diffusion_loss + mask_weight * terms["loss"]
+            diffusion_loss = diffusion_step(
+                pipe,
+                controlnet,
+                batch,
+                prompt,
+                device,
+                dtype,
+                loss_mode=diffusion_loss_mode,
+                mask_weight_scale=diffusion_mask_weight_scale,
+                timestep_min=timestep_min,
+                timestep_max=timestep_max,
+            )
+            total_loss = diffusion_weight * diffusion_loss
             totals["val_total_loss"] += scalar(total_loss)
             totals["val_diffusion_loss"] += scalar(diffusion_loss)
-            totals["val_mask_loss"] += scalar(terms["loss"])
-            totals["val_mask_bce"] += scalar(terms["bce"])
-            totals["val_mask_dice"] += scalar(terms["dice"])
+            if mask_head is not None:
+                condition = batch["controlnet_condition"].to(device=device, dtype=torch.float32)
+                mask = batch["M"].to(device=device, dtype=torch.float32)
+                output = mask_head(condition)
+                terms = auxiliary_mask_head_loss(output.mask_logits, mask, **mask_loss_kwargs)
+                totals["val_mask_loss"] += scalar(terms["loss"])
+                totals["val_mask_bce"] += scalar(terms["bce"])
+                totals["val_mask_dice"] += scalar(terms["dice"])
             batches += 1
             if batches >= max_batches:
                 break
     controlnet.train()
-    mask_head.train()
+    if mask_head is not None:
+        mask_head.train()
     if batches == 0:
         return totals
     return {key: value / batches for key, value in totals.items()}
@@ -450,7 +533,7 @@ def init_wandb_run(
 def save_training_checkpoint(
     paths: RunPaths,
     controlnet: Any,
-    mask_head: Any,
+    mask_head: Any | None,
     optimizer: Any,
     *,
     step: int,
@@ -467,21 +550,24 @@ def save_training_checkpoint(
     optimizer_path = checkpoint_root / "optimizer.pt"
     metadata_path = checkpoint_root / "metadata.json"
     controlnet.save_pretrained(controlnet_path)
-    torch.save(
-        {
-            "model_state_dict": mask_head.state_dict(),
-            "hidden_channels": int(config["sd_controlnet"].get("mask_head_channels", 16)),
-            "step": step,
-            "epoch": epoch,
-        },
-        mask_head_path,
-    )
+    aux_mask_head_value = None
+    if mask_head is not None:
+        torch.save(
+            {
+                "model_state_dict": mask_head.state_dict(),
+                "hidden_channels": int(config["sd_controlnet"].get("mask_head_channels", 16)),
+                "step": step,
+                "epoch": epoch,
+            },
+            mask_head_path,
+        )
+        aux_mask_head_value = str(mask_head_path)
     torch.save({"optimizer_state_dict": optimizer.state_dict(), "step": step, "epoch": epoch}, optimizer_path)
     metadata = {
         "step": step,
         "epoch": epoch,
         "controlnet": str(controlnet_path),
-        "aux_mask_head": str(mask_head_path),
+        "aux_mask_head": aux_mask_head_value,
         "optimizer": str(optimizer_path),
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -490,7 +576,7 @@ def save_training_checkpoint(
     return {
         "root": str(checkpoint_root),
         "controlnet": str(controlnet_path),
-        "aux_mask_head": str(mask_head_path),
+        "aux_mask_head": aux_mask_head_value,
         "optimizer": str(optimizer_path),
         "metadata": str(metadata_path),
     }
@@ -529,7 +615,7 @@ def _load_resumed_training_state(
     resume_root: Path,
     config: dict[str, Any],
     controlnet: Any,
-    mask_head: Any,
+    mask_head: Any | None,
     optimizer: Any,
     device: Any,
     dtype: Any,
@@ -544,7 +630,8 @@ def _load_resumed_training_state(
         raise FileNotFoundError(f"missing {metadata_path}")
     meta = json.loads(metadata_path.read_text(encoding="utf-8"))
     cn_path = Path(str(meta.get("controlnet", resume_root / "controlnet")))
-    head_path = Path(str(meta.get("aux_mask_head", resume_root / "aux_mask_head.pt")))
+    head_value = meta.get("aux_mask_head")
+    head_path = Path(str(head_value)) if head_value else resume_root / "aux_mask_head.pt"
     opt_path = Path(str(meta.get("optimizer", resume_root / "optimizer.pt")))
 
     sd_config = config["sd_controlnet"]
@@ -568,8 +655,12 @@ def _load_resumed_training_state(
         reloaded = ControlNetModel.from_pretrained(cn_path, **cn_kwargs).to(device=device, dtype=dtype)
     controlnet.load_state_dict(reloaded.state_dict())
 
-    head_blob = torch.load(head_path, map_location="cpu")
-    mask_head.load_state_dict(head_blob["model_state_dict"], strict=True)
+    head_blob = {}
+    if mask_head is not None:
+        if not head_path.is_file():
+            raise FileNotFoundError(f"missing {head_path}")
+        head_blob = torch.load(head_path, map_location="cpu")
+        mask_head.load_state_dict(head_blob["model_state_dict"], strict=True)
     opt_blob = torch.load(opt_path, map_location="cpu")
     optimizer.load_state_dict(opt_blob["optimizer_state_dict"])
 
@@ -639,20 +730,26 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
         module.requires_grad_(False)
         module.eval()
     controlnet.train()
-    mask_head = ControlNetAuxMaskHead(
-        in_channels=3,
-        hidden_channels=int(config["sd_controlnet"].get("mask_head_channels", 16)),
-    ).to(device=device, dtype=torch.float32)
-    mask_head.train()
+    mask_head_enabled = bool(config["sd_controlnet"].get("mask_head_enabled", True))
+    mask_head = None
+    if mask_head_enabled:
+        mask_head = ControlNetAuxMaskHead(
+            in_channels=3,
+            hidden_channels=int(config["sd_controlnet"].get("mask_head_channels", 16)),
+        ).to(device=device, dtype=torch.float32)
+        mask_head.train()
     mask_head_checkpoint = config["sd_controlnet"].get("mask_head_checkpoint")
-    if mask_head_checkpoint and not args.resume:
+    if mask_head is not None and mask_head_checkpoint and not args.resume:
         head_path = resolve_project_path(mask_head_checkpoint)
         head_blob = torch.load(head_path, map_location="cpu")
         mask_head.load_state_dict(head_blob["model_state_dict"], strict=True)
         logger.info("loaded auxiliary mask head checkpoint=%s", head_path)
 
+    optimizer_params = list(controlnet.parameters())
+    if mask_head is not None:
+        optimizer_params.extend(mask_head.parameters())
     optimizer = torch.optim.AdamW(
-        list(controlnet.parameters()) + list(mask_head.parameters()),
+        optimizer_params,
         lr=float(config["training"].get("learning_rate", 1e-4)),
     )
     start_step = 0
@@ -667,7 +764,9 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
         if start_step <= 0:
             raise RuntimeError("resume failed: could not read a positive start step from the checkpoint")
     epochs = int(args.epochs or config["training"].get("epochs", 1))
-    steps_per_epoch = len(train_loader)
+    gradient_accumulation_steps = max(1, int(config["training"].get("gradient_accumulation_steps", 1)))
+    micro_batches_per_epoch = len(train_loader)
+    steps_per_epoch = math.ceil(micro_batches_per_epoch / gradient_accumulation_steps)
     configured_max_steps = config["training"].get("max_steps")
     if args.resume is None and args.max_steps is not None:
         max_steps = int(args.max_steps)
@@ -680,10 +779,17 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
         raise RuntimeError(f"resume step {start_step} is already at or past max_steps {max_steps}")
     diffusion_weight = float(config["training"].get("diffusion_loss_weight", 1.0))
     mask_weight = float(config["training"].get("mask_loss_weight", 0.1))
+    if mask_head is None:
+        mask_weight = 0.0
     mask_loss_kwargs = {
         "bce_weight": float(config["training"].get("mask_bce_weight", 1.0)),
         "dice_weight": float(config["training"].get("mask_dice_weight", 0.5)),
     }
+    diffusion_loss_mode = str(config["training"].get("diffusion_loss_mode", "full"))
+    diffusion_mask_weight_scale = float(config["training"].get("diffusion_mask_weight_scale", 0.0))
+    timestep_min = int(config["training"].get("timestep_min", 0) or 0)
+    timestep_max_config = config["training"].get("timestep_max")
+    timestep_max = None if timestep_max_config is None else int(timestep_max_config)
     prompt = str(config["training"].get("prompt", "local deblur restoration"))
     align_target_step = start_step
     resume_ckpt_step = start_step
@@ -704,12 +810,25 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
                 except StopIteration:
                     train_iter = iter(train_loader)
                     batch = next(train_iter)
-                diffusion_loss = diffusion_step(pipe, controlnet, batch, prompt, device, dtype)
-                condition = batch["controlnet_condition"].to(device=device, dtype=torch.float32)
-                mask = batch["M"].to(device=device, dtype=torch.float32)
-                mask_output = mask_head(condition)
-                mask_terms = auxiliary_mask_head_loss(mask_output.mask_logits, mask, **mask_loss_kwargs)
-                total_loss = diffusion_weight * diffusion_loss + mask_weight * mask_terms["loss"]
+                diffusion_loss = diffusion_step(
+                    pipe,
+                    controlnet,
+                    batch,
+                    prompt,
+                    device,
+                    dtype,
+                    loss_mode=diffusion_loss_mode,
+                    mask_weight_scale=diffusion_mask_weight_scale,
+                    timestep_min=timestep_min,
+                    timestep_max=timestep_max,
+                )
+                total_loss = diffusion_weight * diffusion_loss
+                if mask_head is not None:
+                    condition = batch["controlnet_condition"].to(device=device, dtype=torch.float32)
+                    mask = batch["M"].to(device=device, dtype=torch.float32)
+                    mask_output = mask_head(condition)
+                    mask_terms = auxiliary_mask_head_loss(mask_output.mask_logits, mask, **mask_loss_kwargs)
+                    total_loss = total_loss + mask_weight * mask_terms["loss"]
                 optimizer.zero_grad(set_to_none=True)
                 total_loss.backward()
                 optimizer.step()
@@ -729,9 +848,11 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
     validation_batches = int(config["training"].get("validation_batches", 1))
     validation_interval_steps = int(config["training"].get("validation_interval_steps", steps_per_epoch))
     validation_interval_steps = max(1, validation_interval_steps)
+    warmup_steps = max(0, int(config["training"].get("warmup_steps", 0) or 0))
     checkpoint_interval_steps = int(config["training"].get("checkpoint_interval_steps", 0) or 0)
     checkpoint_at_epoch_end = bool(config["training"].get("checkpoint_at_epoch_end", True))
     checkpoint_mid_epoch = bool(config["training"].get("checkpoint_mid_epoch", False))
+    checkpoint_keep_last_n = int(config["training"].get("checkpoint_keep_last_n", 0) or 0)
     explicit_checkpoint_steps = {
         int(value)
         for value in config["training"].get("checkpoint_steps", [])
@@ -769,32 +890,68 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
             "sample_id",
             "train_total_loss",
             "train_diffusion_loss",
-            "train_mask_loss",
-            "train_mask_bce",
-            "train_mask_dice",
             "val_total_loss",
             "val_diffusion_loss",
-            "val_mask_loss",
-            "val_mask_bce",
-            "val_mask_dice",
             "learning_rate",
             "used_baseline_fallback",
         ]
+        if mask_head is not None:
+            fieldnames[5:5] = ["train_mask_loss", "train_mask_bce", "train_mask_dice"]
+            fieldnames[10:10] = ["val_mask_loss", "val_mask_bce", "val_mask_dice"]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
+        optimizer.zero_grad(set_to_none=True)
         for epoch in range(resume_epoch, epochs + 1):
-            for batch in train_loader:
+            accum_count = 0
+            accum_sample_id = ""
+            accum_total_loss = 0.0
+            accum_diffusion_loss = 0.0
+            accum_mask_loss = 0.0
+            accum_mask_bce = 0.0
+            accum_mask_dice = 0.0
+            for micro_index, batch in enumerate(train_loader, start=1):
                 sample_id = batch["sample_id"][0] if isinstance(batch["sample_id"], list) else str(batch["sample_id"])
-                diffusion_loss = diffusion_step(pipe, controlnet, batch, prompt, device, dtype)
-                condition = batch["controlnet_condition"].to(device=device, dtype=torch.float32)
-                mask = batch["M"].to(device=device, dtype=torch.float32)
-                mask_output = mask_head(condition)
-                mask_terms = auxiliary_mask_head_loss(mask_output.mask_logits, mask, **mask_loss_kwargs)
-                total_loss = diffusion_weight * diffusion_loss + mask_weight * mask_terms["loss"]
-                optimizer.zero_grad(set_to_none=True)
-                total_loss.backward()
+                diffusion_loss = diffusion_step(
+                    pipe,
+                    controlnet,
+                    batch,
+                    prompt,
+                    device,
+                    dtype,
+                    loss_mode=diffusion_loss_mode,
+                    mask_weight_scale=diffusion_mask_weight_scale,
+                    timestep_min=timestep_min,
+                    timestep_max=timestep_max,
+                )
+                mask_terms = None
+                total_loss = diffusion_weight * diffusion_loss
+                if mask_head is not None:
+                    condition = batch["controlnet_condition"].to(device=device, dtype=torch.float32)
+                    mask = batch["M"].to(device=device, dtype=torch.float32)
+                    mask_output = mask_head(condition)
+                    mask_terms = auxiliary_mask_head_loss(mask_output.mask_logits, mask, **mask_loss_kwargs)
+                    total_loss = total_loss + mask_weight * mask_terms["loss"]
+                (total_loss / gradient_accumulation_steps).backward()
+                accum_count += 1
+                accum_sample_id = sample_id
+                accum_total_loss += scalar(total_loss)
+                accum_diffusion_loss += scalar(diffusion_loss)
+                if mask_terms is not None:
+                    accum_mask_loss += scalar(mask_terms["loss"])
+                    accum_mask_bce += scalar(mask_terms["bce"])
+                    accum_mask_dice += scalar(mask_terms["dice"])
+                is_epoch_micro_end = micro_index == micro_batches_per_epoch
+                should_optimizer_step = accum_count >= gradient_accumulation_steps or is_epoch_micro_end
+                if not should_optimizer_step:
+                    continue
+                learning_rate = float(config["training"].get("learning_rate", 1e-4))
+                if warmup_steps > 0:
+                    learning_rate = learning_rate * min(1.0, float(step + 1) / float(warmup_steps))
+                for group in optimizer.param_groups:
+                    group["lr"] = learning_rate
                 optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
                 should_validate = (step + 1) % validation_interval_steps == 0 or (step + 1) == max_steps
                 val_metrics = (
@@ -810,6 +967,10 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
                         mask_loss_kwargs,
                         diffusion_weight,
                         mask_weight,
+                        diffusion_loss_mode,
+                        diffusion_mask_weight_scale,
+                        timestep_min,
+                        timestep_max,
                     )
                     if should_validate
                     else {}
@@ -817,21 +978,26 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
                 row = {
                     "step": step + 1,
                     "epoch": epoch,
-                    "sample_id": sample_id,
-                    "train_total_loss": scalar(total_loss),
-                    "train_diffusion_loss": scalar(diffusion_loss),
-                    "train_mask_loss": scalar(mask_terms["loss"]),
-                    "train_mask_bce": scalar(mask_terms["bce"]),
-                    "train_mask_dice": scalar(mask_terms["dice"]),
+                    "sample_id": accum_sample_id,
+                    "train_total_loss": accum_total_loss / accum_count,
+                    "train_diffusion_loss": accum_diffusion_loss / accum_count,
                     "val_total_loss": "",
                     "val_diffusion_loss": "",
-                    "val_mask_loss": "",
-                    "val_mask_bce": "",
-                    "val_mask_dice": "",
                     **val_metrics,
-                    "learning_rate": float(config["training"].get("learning_rate", 1e-4)),
+                    "learning_rate": learning_rate,
                     "used_baseline_fallback": False,
                 }
+                if mask_terms is not None:
+                    row.update(
+                        {
+                            "train_mask_loss": accum_mask_loss / accum_count,
+                            "train_mask_bce": accum_mask_bce / accum_count,
+                            "train_mask_dice": accum_mask_dice / accum_count,
+                            "val_mask_loss": row.get("val_mask_loss", ""),
+                            "val_mask_bce": row.get("val_mask_bce", ""),
+                            "val_mask_dice": row.get("val_mask_dice", ""),
+                        }
+                    )
                 writer.writerow(row)
                 handle.flush()
                 rows.append(row)
@@ -839,26 +1005,46 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
                 if wandb_run is not None and should_log_wandb:
                     wandb_run.log({key: value for key, value in row.items() if value != ""}, step=step + 1)
                 if should_validate:
-                    logger.info(
-                        "step=%s epoch=%s total=%.6f diffusion=%.6f mask=%.6f val_total=%.6f val_diffusion=%.6f val_mask=%.6f fallback=False",
-                        row["step"],
-                        row["epoch"],
-                        row["train_total_loss"],
-                        row["train_diffusion_loss"],
-                        row["train_mask_loss"],
-                        row["val_total_loss"],
-                        row["val_diffusion_loss"],
-                        row["val_mask_loss"],
-                    )
+                    if mask_head is None:
+                        logger.info(
+                            "step=%s epoch=%s total=%.6f diffusion=%.6f val_total=%.6f val_diffusion=%.6f fallback=False",
+                            row["step"],
+                            row["epoch"],
+                            row["train_total_loss"],
+                            row["train_diffusion_loss"],
+                            row["val_total_loss"],
+                            row["val_diffusion_loss"],
+                        )
+                    else:
+                        logger.info(
+                            "step=%s epoch=%s total=%.6f diffusion=%.6f mask=%.6f val_total=%.6f val_diffusion=%.6f val_mask=%.6f fallback=False",
+                            row["step"],
+                            row["epoch"],
+                            row["train_total_loss"],
+                            row["train_diffusion_loss"],
+                            row["train_mask_loss"],
+                            row["val_total_loss"],
+                            row["val_diffusion_loss"],
+                            row["val_mask_loss"],
+                        )
                 else:
-                    logger.info(
-                        "step=%s epoch=%s total=%.6f diffusion=%.6f mask=%.6f fallback=False",
-                        row["step"],
-                        row["epoch"],
-                        row["train_total_loss"],
-                        row["train_diffusion_loss"],
-                        row["train_mask_loss"],
-                    )
+                    if mask_head is None:
+                        logger.info(
+                            "step=%s epoch=%s total=%.6f diffusion=%.6f fallback=False",
+                            row["step"],
+                            row["epoch"],
+                            row["train_total_loss"],
+                            row["train_diffusion_loss"],
+                        )
+                    else:
+                        logger.info(
+                            "step=%s epoch=%s total=%.6f diffusion=%.6f mask=%.6f fallback=False",
+                            row["step"],
+                            row["epoch"],
+                            row["train_total_loss"],
+                            row["train_diffusion_loss"],
+                            row["train_mask_loss"],
+                        )
                 step += 1
                 is_epoch_end = step % steps_per_epoch == 0
                 is_final_step = step >= max_steps
@@ -867,7 +1053,7 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
                     step in explicit_checkpoint_steps
                     or (checkpoint_interval_steps > 0 and step % checkpoint_interval_steps == 0)
                     or is_mid_epoch
-                    or (checkpoint_at_epoch_end and is_epoch_end and not is_final_step)
+                    or (checkpoint_at_epoch_end and is_epoch_end)
                 )
                 if should_checkpoint:
                     checkpoint_paths.append(
@@ -882,8 +1068,22 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
                             logger=logger,
                         )
                     )
+                    if checkpoint_keep_last_n > 0:
+                        while len(checkpoint_paths) > checkpoint_keep_last_n:
+                            stale_checkpoint = checkpoint_paths.pop(0)
+                            stale_root = Path(stale_checkpoint["root"])
+                            if stale_root.exists():
+                                shutil.rmtree(stale_root)
+                                logger.info("removed stale checkpoint path=%s keep_last_n=%s", stale_root, checkpoint_keep_last_n)
                 if is_final_step:
                     break
+                accum_count = 0
+                accum_sample_id = ""
+                accum_total_loss = 0.0
+                accum_diffusion_loss = 0.0
+                accum_mask_loss = 0.0
+                accum_mask_bce = 0.0
+                accum_mask_dice = 0.0
             if step >= max_steps:
                 break
 
@@ -891,14 +1091,17 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
     if bool(config["training"].get("save_controlnet", True)):
         controlnet.save_pretrained(controlnet_path)
     mask_head_path = paths.checkpoint_dir / "aux_mask_head.pt"
-    torch.save(
-        {
-            "model_state_dict": mask_head.state_dict(),
-            "hidden_channels": int(config["sd_controlnet"].get("mask_head_channels", 16)),
-            "step": max_steps,
-        },
-        mask_head_path,
-    )
+    aux_mask_head_artifact = None
+    if mask_head is not None:
+        torch.save(
+            {
+                "model_state_dict": mask_head.state_dict(),
+                "hidden_channels": int(config["sd_controlnet"].get("mask_head_channels", 16)),
+                "step": max_steps,
+            },
+            mask_head_path,
+        )
+        aux_mask_head_artifact = str(mask_head_path)
     config_copy = paths.output_dir / "config_used.yaml"
     shutil.copy2(resolve_project_path(args.config), config_copy)
     final_row = rows[-1] if rows else {}
@@ -923,6 +1126,9 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
             "steps": max_steps,
             "epochs": epochs,
             "steps_per_epoch": steps_per_epoch,
+            "micro_batches_per_epoch": micro_batches_per_epoch,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "warmup_steps": warmup_steps,
             "resumed": bool(args.resume),
             "resume_checkpoint": str(resume_root) if args.resume and resume_root is not None else None,
             "resume_checkpoint_step": start_step if start_step > 0 else None,
@@ -931,9 +1137,15 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
             "checkpoint_interval_steps": checkpoint_interval_steps,
             "checkpoint_at_epoch_end": checkpoint_at_epoch_end,
             "checkpoint_mid_epoch": checkpoint_mid_epoch,
+            "checkpoint_keep_last_n": checkpoint_keep_last_n,
             "batch_size": batch_size,
             "learning_rate": float(config["training"].get("learning_rate", 1e-4)),
+            "diffusion_loss_mode": diffusion_loss_mode,
+            "diffusion_mask_weight_scale": diffusion_mask_weight_scale,
+            "timestep_min": timestep_min,
+            "timestep_max": timestep_max,
             "prompt": prompt,
+            "mask_head_enabled": mask_head is not None,
             "elapsed_seconds": time.time() - start,
             "final_metrics": final_row,
         },
@@ -947,7 +1159,7 @@ def run_training(config: dict[str, Any], args: argparse.Namespace, paths: RunPat
         "artifacts": {
             "checkpoint_dir": str(paths.checkpoint_dir),
             "controlnet": str(controlnet_path),
-            "aux_mask_head": str(mask_head_path),
+            "aux_mask_head": aux_mask_head_artifact,
             "loss_curve": str(paths.loss_curve),
             "log": str(paths.log_file),
             "config": str(config_copy),

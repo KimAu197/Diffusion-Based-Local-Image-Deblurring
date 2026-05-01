@@ -1,0 +1,76 @@
+# Stage 3 fine-tune: full weighted-loss branch after NAFNet COCO pretrain.
+
+experiment:
+  name: stage3_nafnet_reloblur_fullweighted_ft
+  label: stage3_nafnet_reloblur_fullweighted_ft
+  limitation: "ReLoBlur fine-tune with GT-mask NAFNet preprocessing and full-image diffusion loss weighted by 1 + 9 * GT mask latent."
+  output_dir: output/training/stage3_nafnet_reloblur_fullweighted_ft
+  seed: 42
+
+data:
+  manifest: output/datasets/reloblur_real/train_manifest.json
+  val_manifest: output/datasets/reloblur_real/test_manifest.json
+  dataset_name: reloblur_real_nafnet
+  image_size: 512
+  bapc_probability: 1.0
+  bapc_min_mask_ratio: 0.05
+  subset_train_count: 0
+  subset_val_count: 0
+  val_fraction: 0.1
+  split_seed: 42
+  num_workers: 0
+
+nafnet_preprocess:
+  enabled: true
+  model_dir: /root/autodl-tmp/models/modelscope_nafnet/damo/cv_nafnet_image-deblur_gopro
+  mask_blur_radius: 4.0
+  cache_dir: output/cache/nafnet_stage3/reloblur
+
+sd_controlnet:
+  base_sd_checkpoint: /root/autodl-tmp/models/sd15-fp16
+  controlnet_init: from_pretrained
+  controlnet_checkpoint: /root/autodl-tmp/project/output/training/stage3_nafnet_coco_fullweighted_pretrain/checkpoint/controlnet
+  mask_head_checkpoint: null
+  cache_dir: /root/autodl-tmp/cache/huggingface
+  allow_downloads: false
+  local_files_only: true
+  dtype: float32
+  precision: fp32
+  variant: fp16
+  train_controlnet: true
+  train_unet: false
+  train_text_encoder: false
+  train_vae: false
+  mask_head_enabled: false
+  mask_head_channels: 16
+
+training:
+  max_steps: null
+  epochs: 10
+  batch_size: 4
+  learning_rate: 0.000001
+  warmup_steps: 200
+  gradient_accumulation_steps: 4
+  validation_batches: 5
+  validation_interval_steps: 200
+  prompt: local deblur restoration
+  timestep_min: 0
+  timestep_max: 200
+  diffusion_loss_mode: mask_weighted_full
+  diffusion_mask_weight_scale: 9.0
+  diffusion_loss_weight: 1.0
+  mask_loss_weight: 0.0
+  mask_bce_weight: 1.0
+  mask_dice_weight: 0.5
+  save_controlnet: true
+  checkpoint_steps: []
+  checkpoint_interval_steps: 0
+  checkpoint_mid_epoch: false
+  checkpoint_at_epoch_end: true
+  checkpoint_keep_last_n: 2
+
+wandb:
+  enabled: true
+  project: diffusion_blur
+  entity: Columbia_project
+  log_interval_steps: 1

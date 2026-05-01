@@ -10,6 +10,15 @@ transformers
 accelerate
 safetensors
 huggingface_hub
+datasets
 gdown
 scikit-image
 wandb
+einops
+opencv-python-headless
+lmdb
+modelscope
+addict
+yapf
+simplejson
+sortedcontainers

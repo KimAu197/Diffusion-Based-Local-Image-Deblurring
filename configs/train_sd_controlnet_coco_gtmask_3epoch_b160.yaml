@@ -1,0 +1,64 @@
+# COCO SD 1.5 + Tile ControlNet pretraining with fixed GT mask conditioning.
+
+experiment:
+  name: sd_controlnet_coco_gtmask_5epoch_b4_acc4_lr1e-6
+  label: phase2_gtmask_sd15_tile_controlnet_coco20k_5epoch_b4_acc4_lr1e-6
+  limitation: "COCO pretrain using Ib + GT mask as fixed ControlNet condition; mask prediction is not trained in this run."
+  output_dir: output/training/phase2_gtmask_sd15_tile_controlnet_coco20k_5epoch_b4_acc4_lr1e-6
+  seed: 42
+
+data:
+  manifest: data/COCO/train/manifest.json
+  val_manifest: data/COCO/val/manifest.json
+  dataset_name: coco20k_gtmask
+  image_size: 256
+  subset_train_count: 0
+  subset_val_count: 0
+  val_fraction: 0.1
+  split_seed: 42
+  num_workers: 0
+  bapc_probability: 0.0
+  bapc_min_mask_ratio: 0.05
+
+sd_controlnet:
+  base_sd_checkpoint: /root/autodl-tmp/models/sd15-fp16
+  controlnet_init: from_pretrained
+  controlnet_checkpoint: /root/autodl-tmp/project/output/training/phase1_sd15_tile_controlnet_coco_continue_lr5e-7_2epoch_b160/checkpoint/controlnet
+  mask_head_checkpoint: null
+  cache_dir: /root/autodl-tmp/cache/huggingface
+  allow_downloads: false
+  local_files_only: true
+  dtype: float32
+  precision: fp32
+  variant: fp16
+  train_controlnet: true
+  train_unet: false
+  train_text_encoder: false
+  train_vae: false
+  mask_head_enabled: false
+  mask_head_channels: 16
+
+training:
+  max_steps: null
+  epochs: 5
+  batch_size: 4
+  learning_rate: 0.000001
+  gradient_accumulation_steps: 4
+  validation_batches: 6
+  validation_interval_steps: 500
+  prompt: local deblur restoration
+  diffusion_loss_weight: 1.0
+  mask_loss_weight: 0.0
+  mask_bce_weight: 1.0
+  mask_dice_weight: 0.5
+  save_controlnet: true
+  checkpoint_steps: []
+  checkpoint_interval_steps: 0
+  checkpoint_mid_epoch: false
+  checkpoint_at_epoch_end: true
+
+wandb:
+  enabled: true
+  project: diffusion_blur
+  entity: Columbia_project
+  log_interval_steps: 1

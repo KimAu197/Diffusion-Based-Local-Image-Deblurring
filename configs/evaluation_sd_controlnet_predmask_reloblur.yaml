@@ -1,0 +1,48 @@
+evaluation:
+  dry_run: false
+  split: all
+  image_size: 256
+  visual_limit: 5
+
+inference:
+  prompt: local deblur restoration
+  negative_prompt: null
+  num_inference_steps: 30
+  guidance_scale: 3.5
+  strength: 0.55
+  seed: 1234
+
+data:
+  manifest: output/datasets/reloblur_real/test_manifest.json
+
+split:
+  name: all
+  split_seed: 42
+  val_fraction: 0.1
+
+model:
+  type: sd_controlnet
+  checkpoint: /root/autodl-tmp/project/output/training/reloblur_gtmask_weightedloss_lr5e-7_10epoch_b4_acc4/checkpoint/controlnet
+
+sd_controlnet:
+  base_sd_checkpoint: /root/autodl-tmp/models/sd15-fp16
+  controlnet_checkpoint: /root/autodl-tmp/project/output/training/reloblur_gtmask_weightedloss_lr5e-7_10epoch_b4_acc4/checkpoint/controlnet
+  mask_head_checkpoint: null
+  cache_dir: /root/autodl-tmp/cache/huggingface
+  allow_downloads: false
+  local_files_only: true
+  dtype: float32
+  precision: fp32
+  variant: fp16
+  image_size: 256
+  mask_head_enabled: false
+  mask_head_channels: 16
+
+runtime:
+  allow_downloads: false
+  preserve_background: true
+  output_predicted_mask: true
+  use_gt_mask_as_input: false
+  mask_predictor_checkpoint: /root/autodl-tmp/project/output/training/mask_stage1_coco20k_unet_rgb_2600s/best.pt
+  mask_predictor_threshold: 0.55
+  mask_predictor_input_features: rgb

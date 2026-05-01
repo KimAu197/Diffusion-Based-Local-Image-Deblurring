@@ -1,16 +1,40 @@
 # Environment
 .env
+.env.*
+!.env.example
 
 # Cursor IDE (local state / runtime data)
 .cursor/
 
-# Generated outputs and artifacts
+# Local data and generated artifacts
 cache/
+data/
 output/
-results/
+incomplete/
+wandb/
+runs/
+artifacts/
+
+# Never upload model checkpoints or large model weights
+**/checkpoint*/
+**/checkpoints*/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
 
 # Misc
 *.log
 *.pyc
+*.pyo
 *.tmp
-data/
+__pycache__/
+
+# Results: keep visual/log artifacts and metrics tables only
+results/**
+!results/**/
+!results/**/log/
+!results/**/log/**
+!results/**/metrics.csv

@@ -18,12 +18,12 @@ class MaskPredictorOutput:
 
 
 class MaskPredictorUNet(nn.Module):
-    """Compact U-Net for the Stage 1 task: blurred RGB image -> blur mask."""
+    """Compact U-Net for the Stage 1 task: Ib-derived features -> blur mask."""
 
     def __init__(self, in_channels: int = 3, base_channels: int = 16):
         super().__init__()
-        if in_channels != 3:
-            raise ValueError("MaskPredictorUNet expects RGB Ib input with 3 channels")
+        if in_channels <= 0:
+            raise ValueError("in_channels must be positive")
         if base_channels <= 0:
             raise ValueError("base_channels must be positive")
 
@@ -37,8 +37,8 @@ class MaskPredictorUNet(nn.Module):
         self.mask_head = nn.Conv2d(base_channels, 1, kernel_size=3, padding=1)
 
     def forward(self, Ib: torch.Tensor) -> MaskPredictorOutput:
-        if Ib.ndim != 4 or Ib.shape[1] != 3:
-            raise ValueError("Ib must have shape [B, 3, H, W]")
+        if Ib.ndim != 4:
+            raise ValueError("Ib/features must have shape [B, C, H, W]")
 
         e1 = self.enc1(Ib)
         e2 = self.enc2(F.avg_pool2d(e1, kernel_size=2))
