@@ -1,10 +1,60 @@
-# Local Deblur
+# Diffusion-Based Local Image Deblurring
 
-Minimal research scaffold for diffusion-style local image deblurring. The project represents the proposal flow: local blur masks, optional segmentation, ControlNet-style spatial conditioning, CLIP-image-guidance placeholders, progressive pretraining/fine-tuning, repaint-like post-processing, blur-mask prediction for debugging, and PSNR/SSIM evaluation.
+This repository contains the implementation scaffold, experiment artifacts, and final analysis report for a proposal-style study on diffusion-based local image deblurring. The main research direction is to restore only locally blurred regions while preserving the original background, using blur masks, Stable Diffusion, ControlNet-style spatial conditioning, and ReLoBlur fine-tuning.
 
-## Smoke-First Gate
+## Project Summary
 
-All commands are designed to run first in `--dry-run` mode with generated samples. Do not launch full experiments, dataset-scale preparation, checkpoint downloads, or substantial GPU training until the main agent asks the user to confirm those operations.
+The project explored a multi-stage local deblurring pipeline:
+
+- Synthetic COCO local-blur data generation with blur masks.
+- Stage 1 blur-mask prediction from blurred input images.
+- Stable Diffusion 1.5 + Tile ControlNet local restoration.
+- COCO pretraining followed by ReLoBlur fine-tuning.
+- NAFNet preprocessing and direct mask-region restoration as a stronger structure-preserving baseline.
+- Low-noise diffusion refinement experiments with reduced timestep ranges.
+
+The final conclusion is analytical rather than performance-claim oriented: the full SD + ControlNet route was implemented end to end, but it did not produce sufficiently stable real local deblurring. The main failure mode is the trade-off between diffusion-model generation and image fidelity. Motion blur loses information, so diffusion models can hallucinate plausible details that are not faithful to the original scene.
+
+## Final Report
+
+The final report is in `report/`:
+
+- `report/experiment_summary.tex`: LaTeX source for Overleaf.
+- `report/experiment_summary.md`: Markdown source.
+- `report/experiment_summary.html`: HTML version.
+- `report/metrics_overview.csv`: compact metric table used by the report.
+- `report/assets/`: representative figures used by the report.
+
+For Overleaf, upload `report/experiment_summary.tex` and the `report/assets/` directory, then compile with pdfLaTeX.
+
+## Key Findings
+
+- The lightweight synthetic baseline performs well on COCO synthetic validation, showing that local blur supervision is learnable in-distribution.
+- Stage 1 mask prediction works reasonably on COCO but transfers less reliably to ReLoBlur.
+- Direct SD + ControlNet restoration is unstable because the model can change local semantics and texture instead of faithfully reconstructing the original content.
+- NAFNet-style preprocessing helps preserve structure, but it does not fully solve severe local blur.
+- Low-timestep diffusion is a more promising direction because it treats diffusion as local refinement rather than full reconstruction.
+
+## Repository Layout
+
+- `local_deblur/`: data contracts, model wrappers, training helpers, inference, metrics, and evaluation utilities.
+- `evaluation/`: evaluation loop entry point.
+- `scripts/`: data preparation, training, inference, and evaluation scripts.
+- `configs/`: training, inference, and evaluation configurations.
+- `docs/`: project notes and data/status summaries.
+- `report/`: final report source and selected report assets.
+- `results/`: selected result `log/` visualizations and `metrics.csv` files only.
+
+## Artifact Policy
+
+Large generated artifacts are intentionally excluded from GitHub:
+
+- Checkpoints and model weights are not uploaded.
+- `output/`, `data/`, `cache/`, `incomplete/`, `wandb/`, `runs/`, and `artifacts/` are ignored.
+- In `results/`, only `log/` visualizations and `metrics.csv` are intended to be tracked.
+- Full prediction dumps such as `answer.json`, summaries, logs, and checkpoints should remain local.
+
+This keeps the repository small enough for GitHub while preserving the visual evidence and quantitative metrics needed to understand the experiments.
 
 ## Setup
 
@@ -12,9 +62,11 @@ All commands are designed to run first in `--dry-run` mode with generated sample
 pip install -r requirements.txt
 ```
 
-Heavy packages are optional in code paths. Dry-run commands require only common Python image/numeric packages.
+The codebase contains both lightweight smoke paths and heavier diffusion/ControlNet paths. Heavy training or full evaluation requires the corresponding datasets, pretrained checkpoints, and GPU resources.
 
-## Quick Smoke Commands
+## Example Commands
+
+Dry-run smoke checks:
 
 ```bash
 python scripts/prepare_synthetic_data.py --dry-run --count 1
@@ -23,30 +75,4 @@ python scripts/infer.py --dry-run --mask-output output/inference/dry_run_predict
 python -m evaluation.eval_pipeline --model fallback-local-deblur --round smoke --dataset dry-run --count 1 --mode standard --detailed true --dry-run
 ```
 
-Outputs are written under ignored `output/` and `results/` paths.
-
-## Layout
-
-- `local_deblur/data/`: sample contracts, manifest datasets, dry-run data, masks, synthetic blur, crop/transforms.
-- `local_deblur/models/`: conditioning, fallback deblurring, post-processing, and diffusers-compatible pipeline wrapper.
-- `local_deblur/training/`: smoke trainer and restoration loss helpers.
-- `local_deblur/eval/`: metrics, alignment, result output helpers, and evaluation runner utilities.
-- `evaluation/eval_pipeline.py`: evaluation loop entry point only.
-- `scripts/`: data preparation, training, inference, and evaluation shell runner.
-- `configs/`: base, model, data, training, inference, and evaluation configs.
-
-## Full-Data Templates
-
-Full runs require explicit confirmation first.
-
-```bash
-python scripts/prepare_synthetic_data.py --coco-images /data/coco/images --coco-instances /data/coco/instances --output-dir output/synthetic
-python scripts/train.py --phase pretrain --config configs/train_pretrain.yaml --manifest output/synthetic/manifest.json
-python scripts/infer.py --image Ib.png --mask M.png --checkpoint /path/to/local/checkpoint --output output/inference/result.png --mask-output output/inference/predicted_mask.png
-```
-
-Evaluation results use `results/<ROUND>_<MODEL>_<DATASET>_<COUNT>_<MMDD>[_HHMM]/` and include `logging.log`, `metrics.csv`, `summary.txt`, `answer.json`, and `log/`. The `log/` directory includes both restored predictions and predicted blur masks when the mask head is enabled.
-
-## Current Data Status
-
-The current processed dataset is `output/datasets/coco2017_train_grouped_localblur_5k/manifest.json`. It uses COCO instance masks, groups people with nearby carried objects, filters edge/black-border crops, and mixes motion/Gaussian/defocus blur. This existing dataset was generated with a 2% to 35% mask-area range; new synthetic generation defaults to a stricter 5% to 20% range and records blur-kernel parameters in the manifest metadata. See `docs/data_status.md` for details.
+Full experiments should be run only when the required local datasets and checkpoints are available.
