@@ -24,7 +24,7 @@
     - Test share: `test.zip`, 3,267,130,190 bytes.
     - Train share: `s1-4.zip`, `s5-8.zip`, `s9-11.zip`, `s12-15.zip`, `s16.zip`, `s17-19.zip`, 15,398,217,837 bytes total.
     - Mask share: `test.zip`, `train.zip`, 61,343,879 bytes total.
-  - Baidu download blocker: direct PCS download returns `user not exists`; BaiduPCS-Go transfer returns `获取分享项元数据错误`; `api/sharedownload` requires page signing/verification. A Baidu authenticated download method or valid browser cookies are needed to fetch the archives.
+  - Baidu download blocker: direct PCS download returns `user not exists`; BaiduPCS-Go transfer returns a shared-item metadata retrieval error; `api/sharedownload` requires page signing/verification. A Baidu authenticated download method or valid browser cookies are needed to fetch the archives.
   - Converter ready: after data is placed locally, run `python scripts/prepare_reloblur_manifest.py --dataset-root <path>/dataset --masks-root <path>/masks --output-dir output/datasets/reloblur --split all --validate-images`.
 
 ## Processed
